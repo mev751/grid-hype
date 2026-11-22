@@ -8,6 +8,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+  checks: write
+
 jobs:
   build-linux-amd64:
     name: Build Linux x86_64 Binary
@@ -30,7 +34,18 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run unit tests
-        run: cargo test --verbose
+        run: |
+          RUST_BACKTRACE=1 cargo test --verbose -- --nocapture 2>&1 | tee test_output.log || {
+            echo "## ❌ Unit Tests Failed" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 120 test_output.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          }
+          echo "## ✅ Unit Tests Passed" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -n 60 test_output.log >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Build Release Binary (x86_64-unknown-linux-gnu)
         run: |
@@ -50,3 +65,19 @@ jobs:
             dist/config.toml
             grid-hype-linux-amd64.tar.gz
           retention-days: 30
+
+      - name: Create GitHub Release and Upload Assets
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.0
+          name: "Grid Hype Release v0.1.0"
+          draft: false
+          prerelease: false
+          files: |
+            dist/grid-hype
+            dist/config.toml
+            grid-hype-linux-amd64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
