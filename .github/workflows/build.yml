@@ -1,0 +1,52 @@
+name: Build and Release Linux AMD64 Binary
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux-amd64:
+    name: Build Linux x86_64 Binary
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev build-essential cmake clang
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests
+        run: cargo test --verbose
+
+      - name: Build Release Binary (x86_64-unknown-linux-gnu)
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/grid-hype dist/grid-hype
+          cp config.toml dist/config.toml
+          chmod +x dist/grid-hype
+          tar -czvf grid-hype-linux-amd64.tar.gz -C dist grid-hype config.toml
+
+      - name: Upload Linux AMD64 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grid-hype-linux-amd64
+          path: |
+            dist/grid-hype
+            dist/config.toml
+            grid-hype-linux-amd64.tar.gz
+          retention-days: 30

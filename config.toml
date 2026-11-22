@@ -1,0 +1,45 @@
+# =============================================================================
+# Grid-HYPE: NautilusTrader Hyperliquid Maker Grid Arbitrage Configuration
+# =============================================================================
+
+[grid]
+# 交易币种 (Hyperliquid 永续合约标的，如 "HYPE" 对应 "HYPE-PERP")
+symbol = "HYPE"
+
+# 网格方向: "long" (做多网格) 或 "short" (做空网格)
+direction = "long"
+
+# 网格价格区间下限与上限 (USDC)
+lower_price = 55.0
+upper_price = 65.0
+
+# 网格数量 (划分 30 格，即 31 个价格档位，每格间距 = (65 - 55) / 30 = 0.333333 USDC)
+grid_count = 30
+
+# 每格下单名义金额 (USDC)
+amount_per_grid = 1000.0
+
+# 开仓与平仓均强制使用 Maker (Post-Only / ALO) 节省手续费
+post_only = true
+
+# 动态上方补单: 当价格上涨突破空闲网格时，是否自动在现价下方新解锁的档位挂出 Maker 开仓单
+follow_price_into_idle_grids = true
+
+[exchange]
+# 是否使用 Hyperliquid 测试网 (false = 主网 Mainnet, true = 测试网 Testnet)
+testnet = false
+
+# 导出私钥的环境变量名 (也可回退读取 PRIVATE_KEY)
+private_key_env = "HYPERLIQUID_PK"
+
+# 可选: Vault 或子账户地址环境变量名
+vault_address_env = "HYPERLIQUID_VAULT"
+
+# 请求超时时间 (秒)
+http_timeout_secs = 15
+
+# 状态巡检与漏单补挂周期 (秒)
+reconcile_interval_secs = 10
+
+# 程序退出时是否自动撤销所有当前挂单
+cancel_on_exit = false
