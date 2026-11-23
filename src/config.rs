@@ -33,6 +33,8 @@ pub struct ExchangeConfig {
     pub vault_address_env: String,
     #[serde(default = "default_account_env")]
     pub account_address_env: String,
+    #[serde(default)]
+    pub account_address: Option<String>,
     #[serde(default = "default_timeout_secs")]
     pub http_timeout_secs: u64,
     #[serde(default = "default_reconcile_secs")]
@@ -160,8 +162,14 @@ impl AppConfig {
         None
     }
 
-    /// Resolves the optional Hyperliquid master account address (for agent/API wallet usage) from the environment.
+    /// Resolves the optional Hyperliquid master account address (for agent/API wallet usage) from config or environment.
     pub fn resolve_account_address(&self) -> Option<String> {
+        if let Some(ref addr) = self.exchange.account_address {
+            let trimmed = addr.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
         let candidates = [
             self.exchange.account_address_env.as_str(),
             "HYPERLIQUID_ACCOUNT_ADDRESS",

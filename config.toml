@@ -38,6 +38,9 @@ vault_address_env = "HYPERLIQUID_VAULT"
 # 可选: 主账户地址环境变量名 (使用 API/Agent 钱包交易时指定持有资金的主账户地址)
 account_address_env = "HYPERLIQUID_ACCOUNT_ADDRESS"
 
+# 可选: 直接配置主账户地址 (如果配置了此项，使用 API 钱包时无需再额外配置环境变量)
+# account_address = "0x716ce5802be364b1fc17d45bd89ce8bc657ea787"
+
 # 请求超时时间 (秒)
 http_timeout_secs = 15
 

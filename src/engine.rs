@@ -218,27 +218,19 @@ impl LiveGridRunner {
         info!(account_address = %user_address, "Resolved Hyperliquid trading account");
 
         let (perp_margin, spot_usdc) = self.check_account_balances(&http_client, &user_address).await;
+        let total_collateral = perp_margin + spot_usdc;
         info!(
             perp_margin_usdc = perp_margin,
             spot_usdc = spot_usdc,
-            "Hyperliquid account balance snapshot"
+            total_collateral_usdc = total_collateral,
+            "Hyperliquid account balance snapshot (Perp equity + Spot USDC portfolio margin)"
         );
 
-        if !self.dry_run && perp_margin < self.cfg.grid.amount_per_grid {
-            if spot_usdc >= 10.0 {
-                bail!(
-                    "Perpetuals account margin is {:.2} USDC, but this grid requires at least {:.2} USDC per slot! \
-                     Found {:.2} USDC in SPOT wallet. \
-                     Please transfer USDC from Spot to Perps on app.hyperliquid.xyz (Trade > Transfer > Spot to Perps).",
-                    perp_margin, self.cfg.grid.amount_per_grid, spot_usdc
-                );
-            } else {
-                bail!(
-                    "Perpetuals account margin is {:.2} USDC (and Spot has {:.2} USDC). \
-                     Please deposit at least {:.2} USDC into your Hyperliquid account to run this grid.",
-                    perp_margin, spot_usdc, self.cfg.grid.amount_per_grid
-                );
-            }
+        if !self.dry_run && total_collateral < 10.0 {
+            warn!(
+                total_collateral_usdc = total_collateral,
+                "Account total collateral is low (< 10 USDC); please ensure sufficient funds to support grid orders."
+            );
         }
 
         let mut slot_cooldowns: HashMap<usize, Instant> = HashMap::new();
