@@ -31,6 +31,8 @@ pub struct ExchangeConfig {
     pub private_key_env: String,
     #[serde(default = "default_vault_env")]
     pub vault_address_env: String,
+    #[serde(default = "default_account_env")]
+    pub account_address_env: String,
     #[serde(default = "default_timeout_secs")]
     pub http_timeout_secs: u64,
     #[serde(default = "default_reconcile_secs")]
@@ -57,6 +59,10 @@ fn default_pk_env() -> String {
 
 fn default_vault_env() -> String {
     "HYPERLIQUID_VAULT".to_string()
+}
+
+fn default_account_env() -> String {
+    "HYPERLIQUID_ACCOUNT_ADDRESS".to_string()
 }
 
 fn default_timeout_secs() -> u64 {
@@ -139,6 +145,28 @@ impl AppConfig {
             self.exchange.vault_address_env.as_str(),
             "HYPERLIQUID_VAULT",
             "HYPERLIQUID_TESTNET_VAULT",
+        ];
+        for var_name in candidates {
+            if var_name.is_empty() {
+                continue;
+            }
+            if let Ok(val) = env::var(var_name) {
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolves the optional Hyperliquid master account address (for agent/API wallet usage) from the environment.
+    pub fn resolve_account_address(&self) -> Option<String> {
+        let candidates = [
+            self.exchange.account_address_env.as_str(),
+            "HYPERLIQUID_ACCOUNT_ADDRESS",
+            "ACCOUNT_ADDRESS",
+            "HL_WALLET_ADDRESS",
         ];
         for var_name in candidates {
             if var_name.is_empty() {

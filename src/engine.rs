@@ -20,7 +20,10 @@ use nautilus_model::{
 };
 use nautilus_network::websocket::TransportBackend;
 use rust_decimal::prelude::ToPrimitive;
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 use tokio::{pin, signal, time};
 use tracing::{error, info, warn};
 
@@ -54,13 +57,15 @@ impl LiveGridRunner {
             "Initializing NautilusTrader Hyperliquid Grid Arbitrage Engine"
         );
 
+        let account_address = self.cfg.resolve_account_address();
         let mut http_client = if self.dry_run {
             match self.cfg.resolve_private_key() {
                 Ok(pk) => {
                     let vault = self.cfg.resolve_vault_address();
-                    HyperliquidHttpClient::from_credentials(
-                        &pk,
-                        vault.as_deref(),
+                    HyperliquidHttpClient::with_credentials(
+                        Some(pk),
+                        vault,
+                        account_address.as_deref(),
                         environment,
                         self.cfg.exchange.http_timeout_secs,
                         None,
@@ -69,20 +74,25 @@ impl LiveGridRunner {
                 }
                 Err(_) => {
                     info!("Dry-run mode without private key: using unauthenticated HTTP client");
-                    HyperliquidHttpClient::new(
+                    let mut client = HyperliquidHttpClient::new(
                         environment,
                         self.cfg.exchange.http_timeout_secs,
                         None,
                     )
-                    .context("Failed to initialize unauthenticated HyperliquidHttpClient")?
+                    .context("Failed to initialize unauthenticated HyperliquidHttpClient")?;
+                    if let Some(ref addr) = account_address {
+                        let _ = client.set_account_address(Some(addr.clone()));
+                    }
+                    client
                 }
             }
         } else {
             let pk = self.cfg.resolve_private_key()?;
             let vault = self.cfg.resolve_vault_address();
-            HyperliquidHttpClient::from_credentials(
-                &pk,
-                vault.as_deref(),
+            HyperliquidHttpClient::with_credentials(
+                Some(pk),
+                vault,
+                account_address.as_deref(),
                 environment,
                 self.cfg.exchange.http_timeout_secs,
                 None,
@@ -204,8 +214,34 @@ impl LiveGridRunner {
 
         let user_address = http_client
             .get_account_address()
-            .context("Failed to resolve user/vault account address from private key")?;
-        info!(account_address = %user_address, "Authenticated Hyperliquid trading account");
+            .context("Failed to resolve user/vault account address from private key or HYPERLIQUID_ACCOUNT_ADDRESS")?;
+        info!(account_address = %user_address, "Resolved Hyperliquid trading account");
+
+        let (perp_margin, spot_usdc) = self.check_account_balances(&http_client, &user_address).await;
+        info!(
+            perp_margin_usdc = perp_margin,
+            spot_usdc = spot_usdc,
+            "Hyperliquid account balance snapshot"
+        );
+
+        if !self.dry_run && perp_margin < self.cfg.grid.amount_per_grid {
+            if spot_usdc >= 10.0 {
+                bail!(
+                    "Perpetuals account margin is {:.2} USDC, but this grid requires at least {:.2} USDC per slot! \
+                     Found {:.2} USDC in SPOT wallet. \
+                     Please transfer USDC from Spot to Perps on app.hyperliquid.xyz (Trade > Transfer > Spot to Perps).",
+                    perp_margin, self.cfg.grid.amount_per_grid, spot_usdc
+                );
+            } else {
+                bail!(
+                    "Perpetuals account margin is {:.2} USDC (and Spot has {:.2} USDC). \
+                     Please deposit at least {:.2} USDC into your Hyperliquid account to run this grid.",
+                    perp_margin, spot_usdc, self.cfg.grid.amount_per_grid
+                );
+            }
+        }
+
+        let mut slot_cooldowns: HashMap<usize, Instant> = HashMap::new();
 
         // Initialize WebSocket client for low-latency market data & order execution
         let url = ws_url(environment).to_string();
@@ -232,13 +268,24 @@ impl LiveGridRunner {
             .context("Failed to subscribe to user orderUpdates and userEvents")?;
 
         info!("WebSocket streams active; placing initial Maker grid orders...");
+        let mut initial_to_place = initial_intents;
+        initial_to_place.retain(|intent| {
+            if let Some(retry_at) = slot_cooldowns.get(&intent.slot_index) {
+                if Instant::now() < *retry_at {
+                    return false;
+                }
+            }
+            true
+        });
+
         self.dispatch_intents(
             &ws_client,
             &http_client,
             instrument_id,
             sz_decimals,
             &mut grid,
-            initial_intents,
+            &mut slot_cooldowns,
+            initial_to_place,
         )
         .await;
 
@@ -263,7 +310,15 @@ impl LiveGridRunner {
                                 if bid > 0.0 && ask > 0.0 {
                                     best_bid = bid;
                                     best_ask = ask;
-                                    let intents = grid.on_market_price(best_bid, best_ask);
+                                    let mut intents = grid.on_market_price(best_bid, best_ask);
+                                    intents.retain(|intent| {
+                                        if let Some(retry_at) = slot_cooldowns.get(&intent.slot_index) {
+                                            if Instant::now() < *retry_at {
+                                                return false;
+                                            }
+                                        }
+                                        true
+                                    });
                                     if !intents.is_empty() {
                                         self.dispatch_intents(
                                             &ws_client,
@@ -271,6 +326,7 @@ impl LiveGridRunner {
                                             instrument_id,
                                             sz_decimals,
                                             &mut grid,
+                                            &mut slot_cooldowns,
                                             intents,
                                         )
                                         .await;
@@ -369,7 +425,15 @@ impl LiveGridRunner {
                     {
                         best_bid = bid;
                         best_ask = ask;
-                        let intents = grid.on_market_price(best_bid, best_ask);
+                        let mut intents = grid.on_market_price(best_bid, best_ask);
+                        intents.retain(|intent| {
+                            if let Some(retry_at) = slot_cooldowns.get(&intent.slot_index) {
+                                if Instant::now() < *retry_at {
+                                    return false;
+                                }
+                            }
+                            true
+                        });
                         if !intents.is_empty() {
                             self.dispatch_intents(
                                 &ws_client,
@@ -377,6 +441,7 @@ impl LiveGridRunner {
                                 instrument_id,
                                 sz_decimals,
                                 &mut grid,
+                                &mut slot_cooldowns,
                                 intents,
                             )
                             .await;
@@ -397,6 +462,37 @@ impl LiveGridRunner {
         Ok(())
     }
 
+    async fn check_account_balances(
+        &self,
+        http_client: &HyperliquidHttpClient,
+        user_address: &str,
+    ) -> (f64, f64) {
+        let mut perp_margin = 0.0;
+        let mut spot_usdc = 0.0;
+
+        if let Ok(perp_val) = http_client.info_clearinghouse_state(user_address).await {
+            if let Some(margin_summary) = perp_val.get("marginSummary") {
+                if let Some(val_str) = margin_summary.get("accountValue").and_then(|v| v.as_str()) {
+                    perp_margin = val_str.parse::<f64>().unwrap_or(0.0);
+                }
+            }
+        }
+
+        if let Ok(spot_val) = http_client.info_spot_clearinghouse_state(user_address).await {
+            if let Some(balances) = spot_val.get("balances").and_then(|v| v.as_array()) {
+                for b in balances {
+                    if b.get("coin").and_then(|c| c.as_str()) == Some("USDC") {
+                        if let Some(total_str) = b.get("total").and_then(|t| t.as_str()) {
+                            spot_usdc = total_str.parse::<f64>().unwrap_or(0.0);
+                        }
+                    }
+                }
+            }
+        }
+
+        (perp_margin, spot_usdc)
+    }
+
     async fn dispatch_intents(
         &self,
         ws_client: &HyperliquidWebSocketClient,
@@ -404,6 +500,7 @@ impl LiveGridRunner {
         instrument_id: InstrumentId,
         sz_decimals: u8,
         grid: &mut GridEngine,
+        slot_cooldowns: &mut HashMap<usize, Instant>,
         intents: Vec<GridOrderIntent>,
     ) {
         for intent in intents {
@@ -451,20 +548,50 @@ impl LiveGridRunner {
                             slot = intent.slot_index,
                             client_order_id = %intent.client_order_id,
                             status = ?report.order_status,
-                            "Order rejected immediately (likely Post-Only ALO crossing); reverting slot for next tick"
+                            "Order rejected immediately (likely Post-Only ALO crossing); cooling down slot for 5s"
                         );
+                        slot_cooldowns.insert(intent.slot_index, Instant::now() + Duration::from_secs(5));
                         grid.on_order_terminal_unfilled(&intent.client_order_id);
+                    } else {
+                        slot_cooldowns.remove(&intent.slot_index);
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    slot_cooldowns.remove(&intent.slot_index);
+                }
                 Err(e) => {
+                    let err_msg = e.to_string();
+                    let is_fatal_auth = err_msg.contains("does not exist") || err_msg.contains("API error");
+                    let is_rate_limit = err_msg.contains("Rate limited") || err_msg.contains("2000 messages");
+
+                    let cooldown_secs = if is_fatal_auth {
+                        30
+                    } else if is_rate_limit {
+                        15
+                    } else {
+                        5
+                    };
+
                     error!(
                         slot = intent.slot_index,
                         client_order_id = %intent.client_order_id,
-                        error = %e,
-                        "Order submission failed; reverting slot state to retry on next tick"
+                        error = %err_msg,
+                        cooldown_secs,
+                        "Order submission failed; backing off slot to protect rate limits"
                     );
+
+                    slot_cooldowns.insert(intent.slot_index, Instant::now() + Duration::from_secs(cooldown_secs));
                     grid.on_order_terminal_unfilled(&intent.client_order_id);
+
+                    if is_rate_limit {
+                        warn!("Hit Hyperliquid rate limit; pausing intent dispatch loop for 10s");
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        break;
+                    } else if is_fatal_auth {
+                        warn!("Exchange rejected account/wallet; pausing dispatch loop for 3s");
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        break;
+                    }
                 }
             }
         }
