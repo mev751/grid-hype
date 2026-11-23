@@ -371,6 +371,7 @@ impl LiveGridRunner {
                                                         instrument_id,
                                                         sz_decimals,
                                                         &mut grid,
+                                                        &mut slot_cooldowns,
                                                         next_intents,
                                                     )
                                                     .await;
