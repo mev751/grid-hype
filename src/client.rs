@@ -58,13 +58,12 @@ impl HyperliquidClient {
                 .context("Failed to parse private key into LocalWallet")?;
             wallet_address = Some(format!("{:?}", wallet.address()));
 
-            let vault_addr = account_address.and_then(|addr| addr.parse().ok());
             let client = ExchangeClient::new(
                 Some(http_client.clone()),
                 wallet,
                 Some(base_url),
                 None,
-                vault_addr,
+                None,
             )
             .await
             .context("Failed to initialize Hyperliquid ExchangeClient")?;
