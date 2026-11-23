@@ -12,6 +12,8 @@ pub enum SlotState {
     Idle,
     /// Opening Maker order is resting on the book (`Buy` for Long, `Sell` for Short).
     EntryWorking { client_order_id: ClientOrderId },
+    /// Cancellation requested for entry order; still in order_to_slot until exchange confirms cancel or fill.
+    EntryCanceling { client_order_id: ClientOrderId },
     /// Entry order filled, waiting for market price to allow placing a valid Post-Only exit order.
     HoldingWaitingExit,
     /// Closing Maker (`reduce_only`) order is resting on the book (`Sell` for Long, `Buy` for Short).
@@ -244,18 +246,13 @@ impl GridEngine {
             }
 
             let entry_price = self.slots[idx].entry_price;
-            let is_valid_entry = match direction {
-                Direction::Long => {
-                    entry_price < mid_price
-                        && Self::can_place_maker(OrderSide::Buy, entry_price, best_bid, best_ask)
-                }
-                Direction::Short => {
-                    entry_price > mid_price
-                        && Self::can_place_maker(OrderSide::Sell, entry_price, best_bid, best_ask)
-                }
+            let is_below_market = match direction {
+                Direction::Long => entry_price <= mid_price,
+                Direction::Short => entry_price >= mid_price,
             };
 
-            if is_valid_entry {
+            // An entry slot is a candidate if it is below/above market price, OR if it is already working/canceling
+            if is_below_market || matches!(state, SlotState::EntryWorking { .. } | SlotState::EntryCanceling { .. }) {
                 candidate_entry_indices.push(idx);
             }
         }
@@ -287,34 +284,37 @@ impl GridEngine {
             if let SlotState::EntryWorking { client_order_id } = self.slots[idx].state {
                 if !target_slots.contains(&idx) {
                     plan.orders_to_cancel.push((idx, client_order_id));
-                    self.order_to_slot.remove(&client_order_id);
-                    self.slots[idx].state = SlotState::Idle;
+                    // Keep order_to_slot mapping intact so fill events can still be resolved!
+                    self.slots[idx].state = SlotState::EntryCanceling { client_order_id };
                 }
             }
         }
 
-        // Arm any target slots that are currently Idle
+        // Arm any target slots that are currently Idle (only if can_place_maker is true)
         for &idx in &target_slots {
             if matches!(self.slots[idx].state, SlotState::Idle) {
-                let cloid = self.next_client_order_id(idx, true);
                 let side = match direction {
                     Direction::Long => OrderSide::Buy,
                     Direction::Short => OrderSide::Sell,
                 };
-                self.slots[idx].state = SlotState::EntryWorking {
-                    client_order_id: cloid,
-                };
-                self.order_to_slot.insert(cloid, (idx, true));
-                plan.orders_to_place.push(GridOrderIntent {
-                    slot_index: idx,
-                    client_order_id: cloid,
-                    side,
-                    price: self.slots[idx].entry_price,
-                    quantity: self.slots[idx].quantity,
-                    post_only,
-                    reduce_only: false,
-                    is_entry: true,
-                });
+                let entry_price = self.slots[idx].entry_price;
+                if Self::can_place_maker(side, entry_price, best_bid, best_ask) {
+                    let cloid = self.next_client_order_id(idx, true);
+                    self.slots[idx].state = SlotState::EntryWorking {
+                        client_order_id: cloid,
+                    };
+                    self.order_to_slot.insert(cloid, (idx, true));
+                    plan.orders_to_place.push(GridOrderIntent {
+                        slot_index: idx,
+                        client_order_id: cloid,
+                        side,
+                        price: entry_price,
+                        quantity: self.slots[idx].quantity,
+                        post_only,
+                        reduce_only: false,
+                        is_entry: true,
+                    });
+                }
             }
         }
 
@@ -385,7 +385,7 @@ impl GridEngine {
 
             match slot.state {
                 SlotState::Idle => {}
-                SlotState::EntryWorking { .. } => {
+                SlotState::EntryWorking { .. } | SlotState::EntryCanceling { .. } => {
                     active_entry_orders += 1;
                     total_working_entry_notional_usdc += slot.quantity * slot.entry_price;
                 }
@@ -545,5 +545,48 @@ mod tests {
         assert_eq!(summary.active_entry_orders, 3); // slots 12, 13, 14
         assert_eq!(summary.active_exit_orders, 1);  // slot 15
         assert_eq!(summary.holding_slots, 1);
+    }
+
+    #[test]
+    fn working_entry_order_is_not_canceled_when_price_drops_to_or_below_its_price() {
+        let mut cfg = sample_hype_long_config();
+        cfg.active_entry_grids = 3;
+        let mut engine = GridEngine::new(cfg, 2).expect("valid engine");
+
+        let plan = engine.on_market_price(60.11, 60.13);
+        assert_eq!(plan.orders_to_place.len(), 3);
+        assert!(plan.orders_to_cancel.is_empty());
+
+        // Price drops to 60.00 / 60.01 (touching entry price of slot 15)
+        let tick_plan = engine.on_market_price(60.00, 60.01);
+        // It must NOT cancel slot 15!
+        assert!(tick_plan.orders_to_cancel.is_empty(), "Must not cancel resting entry order when price touches it");
+        assert!(tick_plan.orders_to_place.is_empty());
+
+        // Price drops further to 59.99 / 60.00
+        let dip_plan = engine.on_market_price(59.99, 60.00);
+        assert!(dip_plan.orders_to_cancel.is_empty(), "Must not cancel resting entry order when price drops below it");
+    }
+
+    #[test]
+    fn entry_canceling_order_still_processes_fill_and_places_exit() {
+        let mut cfg = sample_hype_long_config();
+        cfg.active_entry_grids = 3;
+        let mut engine = GridEngine::new(cfg, 2).expect("valid engine");
+
+        let plan = engine.on_market_price(60.11, 60.13);
+        // Armed slots 13, 14, 15
+        assert_eq!(plan.orders_to_place.len(), 3);
+        let slot_13_order = plan.orders_to_place[0].clone();
+
+        // Price rallies to 60.70 / 60.72: new window arms slots 15, 16, 17; slot 13 is outside window
+        let rally_plan = engine.on_market_price(60.70, 60.72);
+        assert!(rally_plan.orders_to_cancel.iter().any(|(s, _)| *s == 13));
+
+        // Before cancel confirms at venue, slot 13 order fills at 59.333!
+        let fill_plan = engine.on_order_filled(&slot_13_order.client_order_id, 59.30, 59.35);
+        // Must successfully place exit order for slot 13!
+        let has_exit_13 = fill_plan.orders_to_place.iter().any(|o| o.slot_index == 13 && !o.is_entry && o.reduce_only);
+        assert!(has_exit_13, "Must place Exit order for slot 13 even if cancel was in-flight");
     }
 }

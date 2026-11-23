@@ -204,6 +204,7 @@ impl LiveGridRunner {
                         }
                     }
                     SlotState::EntryWorking { .. } => "MAKER ENTRY ARMED (Active Window)",
+                    SlotState::EntryCanceling { .. } => "CANCELING ENTRY",
                     SlotState::HoldingWaitingExit => "HOLDING (WAIT EXIT)",
                     SlotState::ExitWorking { .. } => "MAKER EXIT ARMED",
                 };
@@ -633,6 +634,7 @@ impl LiveGridRunner {
         for slot in grid.slots() {
             match &slot.state {
                 SlotState::EntryWorking { client_order_id }
+                | SlotState::EntryCanceling { client_order_id }
                 | SlotState::ExitWorking { client_order_id } => {
                     cancels.push((instrument_id, *client_order_id, None));
                 }
