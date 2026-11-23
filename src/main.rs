@@ -1,13 +1,7 @@
-mod client;
-mod config;
-mod engine;
-mod grid;
-mod precision;
-
 use anyhow::Result;
 use clap::Parser;
-use config::AppConfig;
-use engine::LiveGridRunner;
+use grid_hype::config::AppConfig;
+use grid_hype::engine::LiveGridRunner;
 use std::path::PathBuf;
 use tracing_subscriber::{EnvFilter, fmt};
 
