@@ -4,7 +4,7 @@ use crate::{
     grid::{GridActionPlan, GridEngine, GridOrderIntent, SlotState},
     precision::{format_hl_price, format_hl_size},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::{
     collections::{HashMap, HashSet},
     time::{Duration, Instant},
