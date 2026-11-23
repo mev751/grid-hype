@@ -47,20 +47,33 @@ jobs:
           tail -n 60 test_output.log >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-      - name: Build Release Binary (x86_64-unknown-linux-gnu)
+      - name: Build Release Binary
         run: |
-          RUST_BACKTRACE=1 cargo build --release --target x86_64-unknown-linux-gnu 2>&1 | tee build_output.log || {
-            echo "## ❌ Build Failed" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -n 150 build_output.log >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            exit 1
-          }
+          set -o pipefail
+          RUST_BACKTRACE=1 cargo build --release --verbose 2>&1 | tee build_output.log
           mkdir -p dist
-          cp target/x86_64-unknown-linux-gnu/release/grid-hype dist/grid-hype
+          cp target/release/grid-hype dist/grid-hype
           cp config.toml dist/config.toml
           chmod +x dist/grid-hype
           tar -czvf grid-hype-linux-amd64.tar.gz -C dist grid-hype config.toml
+
+      - name: Report Build Failure
+        if: failure()
+        run: |
+          if [ -f build_output.log ]; then
+            echo "## ❌ Build Failure Details" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 100 build_output.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            
+            COMMENT_BODY=$(tail -n 60 build_output.log | sed 's/"/\\"/g')
+            gh api repos/${{ github.repository }}/commits/${{ github.sha }}/comments -f body="### ❌ Build Failure
+          \`\`\`
+          $COMMENT_BODY
+          \`\`\`" || true
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Linux AMD64 Artifact
         uses: actions/upload-artifact@v4
@@ -70,6 +83,7 @@ jobs:
             dist/grid-hype
             dist/config.toml
             grid-hype-linux-amd64.tar.gz
+            build_output.log
           retention-days: 30
 
       - name: Create GitHub Release and Upload Assets
