@@ -43,6 +43,25 @@ pub struct GridOrderIntent {
     pub is_entry: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GridActionPlan {
+    pub orders_to_place: Vec<GridOrderIntent>,
+    pub orders_to_cancel: Vec<(usize, ClientOrderId)>,
+}
+
+impl GridActionPlan {
+    pub fn empty() -> Self {
+        Self {
+            orders_to_place: Vec::new(),
+            orders_to_cancel: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.orders_to_place.is_empty() && self.orders_to_cancel.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GridSummary {
     pub total_grids: usize,
@@ -176,188 +195,162 @@ impl GridEngine {
     ///   - Retries any `HoldingWaitingExit` slot whose exit order can now be placed as Maker without crossing.
     ///   - If `follow_price_into_idle_grids` is true (or for any slot below current market price that became `Idle`
     ///     after a fill/rejection), places the Maker entry order once price is on the valid Maker side.
-    pub fn on_market_price(&mut self, best_bid: f64, best_ask: f64) -> Vec<GridOrderIntent> {
+    pub fn on_market_price(&mut self, best_bid: f64, best_ask: f64) -> GridActionPlan {
         if !best_bid.is_finite() || !best_ask.is_finite() || best_bid <= 0.0 || best_ask <= 0.0 {
-            return Vec::new();
+            return GridActionPlan::empty();
         }
         let mid_price = (best_bid + best_ask) * 0.5;
-        let is_first = !self.initialized;
         self.initialized = true;
 
-        let mut intents = Vec::new();
+        let mut plan = GridActionPlan::empty();
         let direction = self.cfg.direction;
         let post_only = self.cfg.post_only;
-        let follow_idle = self.cfg.follow_price_into_idle_grids;
+        let active_entry_limit = self.cfg.active_entry_grids;
 
+        // 1. Evaluate any HoldingWaitingExit slots (exit orders waiting to be placed)
         for idx in 0..self.slots.len() {
-            let state = self.slots[idx].state.clone();
-            let entry_price = self.slots[idx].entry_price;
-            let exit_price = self.slots[idx].exit_price;
-            let quantity = self.slots[idx].quantity;
-
-            match state {
-                SlotState::Idle => {
-                    let should_arm_entry = match direction {
-                        Direction::Long => {
-                            if is_first || follow_idle {
-                                entry_price < mid_price
-                                    && Self::can_place_maker(
-                                        OrderSide::Buy,
-                                        entry_price,
-                                        best_bid,
-                                        best_ask,
-                                    )
-                            } else {
-                                false
-                            }
-                        }
-                        Direction::Short => {
-                            if is_first || follow_idle {
-                                entry_price > mid_price
-                                    && Self::can_place_maker(
-                                        OrderSide::Sell,
-                                        entry_price,
-                                        best_bid,
-                                        best_ask,
-                                    )
-                            } else {
-                                false
-                            }
-                        }
+            if matches!(self.slots[idx].state, SlotState::HoldingWaitingExit) {
+                let exit_side = match direction {
+                    Direction::Long => OrderSide::Sell,
+                    Direction::Short => OrderSide::Buy,
+                };
+                let exit_price = self.slots[idx].exit_price;
+                if Self::can_place_maker(exit_side, exit_price, best_bid, best_ask) {
+                    let cloid = self.next_client_order_id(idx, false);
+                    self.slots[idx].state = SlotState::ExitWorking {
+                        client_order_id: cloid,
                     };
-
-                    if should_arm_entry {
-                        let cloid = self.next_client_order_id(idx, true);
-                        let side = match direction {
-                            Direction::Long => OrderSide::Buy,
-                            Direction::Short => OrderSide::Sell,
-                        };
-                        self.slots[idx].state = SlotState::EntryWorking {
-                            client_order_id: cloid,
-                        };
-                        self.order_to_slot.insert(cloid, (idx, true));
-                        intents.push(GridOrderIntent {
-                            slot_index: idx,
-                            client_order_id: cloid,
-                            side,
-                            price: entry_price,
-                            quantity,
-                            post_only,
-                            reduce_only: false,
-                            is_entry: true,
-                        });
-                    }
+                    self.order_to_slot.insert(cloid, (idx, false));
+                    plan.orders_to_place.push(GridOrderIntent {
+                        slot_index: idx,
+                        client_order_id: cloid,
+                        side: exit_side,
+                        price: exit_price,
+                        quantity: self.slots[idx].quantity,
+                        post_only,
+                        reduce_only: true,
+                        is_entry: false,
+                    });
                 }
-                SlotState::HoldingWaitingExit => {
-                    let exit_side = match direction {
-                        Direction::Long => OrderSide::Sell,
-                        Direction::Short => OrderSide::Buy,
-                    };
-                    if Self::can_place_maker(exit_side, exit_price, best_bid, best_ask) {
-                        let cloid = self.next_client_order_id(idx, false);
-                        self.slots[idx].state = SlotState::ExitWorking {
-                            client_order_id: cloid,
-                        };
-                        self.order_to_slot.insert(cloid, (idx, false));
-                        intents.push(GridOrderIntent {
-                            slot_index: idx,
-                            client_order_id: cloid,
-                            side: exit_side,
-                            price: exit_price,
-                            quantity,
-                            post_only,
-                            reduce_only: true,
-                            is_entry: false,
-                        });
-                    }
-                }
-                SlotState::EntryWorking { .. } | SlotState::ExitWorking { .. } => {}
             }
         }
 
-        intents
+        // 2. Evaluate candidate entry slots
+        let mut candidate_entry_indices: Vec<usize> = Vec::new();
+        for idx in 0..self.slots.len() {
+            let state = &self.slots[idx].state;
+            if matches!(state, SlotState::HoldingWaitingExit | SlotState::ExitWorking { .. }) {
+                continue;
+            }
+
+            let entry_price = self.slots[idx].entry_price;
+            let is_valid_entry = match direction {
+                Direction::Long => {
+                    entry_price < mid_price
+                        && Self::can_place_maker(OrderSide::Buy, entry_price, best_bid, best_ask)
+                }
+                Direction::Short => {
+                    entry_price > mid_price
+                        && Self::can_place_maker(OrderSide::Sell, entry_price, best_bid, best_ask)
+                }
+            };
+
+            if is_valid_entry {
+                candidate_entry_indices.push(idx);
+            }
+        }
+
+        // Sort candidate slots closest to current market price
+        match direction {
+            Direction::Long => candidate_entry_indices.sort_by(|&a, &b| {
+                self.slots[b]
+                    .entry_price
+                    .partial_cmp(&self.slots[a].entry_price)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            Direction::Short => candidate_entry_indices.sort_by(|&a, &b| {
+                self.slots[a]
+                    .entry_price
+                    .partial_cmp(&self.slots[b].entry_price)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+        }
+
+        let target_slots: Vec<usize> = if active_entry_limit == 0 {
+            candidate_entry_indices.clone()
+        } else {
+            candidate_entry_indices.into_iter().take(active_entry_limit).collect()
+        };
+
+        // Cancel any active EntryWorking slots that are no longer in target_slots
+        for idx in 0..self.slots.len() {
+            if let SlotState::EntryWorking { client_order_id } = self.slots[idx].state {
+                if !target_slots.contains(&idx) {
+                    plan.orders_to_cancel.push((idx, client_order_id));
+                    self.order_to_slot.remove(&client_order_id);
+                    self.slots[idx].state = SlotState::Idle;
+                }
+            }
+        }
+
+        // Arm any target slots that are currently Idle
+        for &idx in &target_slots {
+            if matches!(self.slots[idx].state, SlotState::Idle) {
+                let cloid = self.next_client_order_id(idx, true);
+                let side = match direction {
+                    Direction::Long => OrderSide::Buy,
+                    Direction::Short => OrderSide::Sell,
+                };
+                self.slots[idx].state = SlotState::EntryWorking {
+                    client_order_id: cloid,
+                };
+                self.order_to_slot.insert(cloid, (idx, true));
+                plan.orders_to_place.push(GridOrderIntent {
+                    slot_index: idx,
+                    client_order_id: cloid,
+                    side,
+                    price: self.slots[idx].entry_price,
+                    quantity: self.slots[idx].quantity,
+                    post_only,
+                    reduce_only: false,
+                    is_entry: true,
+                });
+            }
+        }
+
+        plan
     }
 
     /// Called when an order with `client_order_id` is completely filled.
-    /// - If it was an **Entry** order for slot `i`: immediately arms the **Exit** (`reduce_only`) Maker order
-    ///   at slot `i`'s `exit_price` (level `i + 1` for Long, level `i - 1` for Short), or transitions to
-    ///   `HoldingWaitingExit` if the current book would cause a Post-Only cross.
+    /// - If it was an **Entry** order for slot `i`: transitions slot `i` to holding inventory and
+    ///   evaluates the grid, placing the **Exit** order at `exit_price` AND automatically arming the next
+    ///   entry slot 1 grid below ("成交一格再挂1格").
     /// - If it was an **Exit** order for slot `i`: increments `completed_cycles` and `realized_gross_pnl_usdc`,
-    ///   resets slot `i` to `Idle`, and immediately re-arms the **Entry** Maker order at `entry_price` if
-    ///   current book allows Maker placement.
+    ///   resets slot `i` to `Idle`, and evaluates the grid to arm the active window.
     pub fn on_order_filled(
         &mut self,
         client_order_id: &ClientOrderId,
         best_bid: f64,
         best_ask: f64,
-    ) -> Vec<GridOrderIntent> {
+    ) -> GridActionPlan {
         let Some((slot_idx, is_entry)) = self.order_to_slot.remove(client_order_id) else {
-            return Vec::new();
+            return GridActionPlan::empty();
         };
 
-        let direction = self.cfg.direction;
-        let post_only = self.cfg.post_only;
         let entry_price = self.slots[slot_idx].entry_price;
         let exit_price = self.slots[slot_idx].exit_price;
         let quantity = self.slots[slot_idx].quantity;
-        let mut intents = Vec::new();
 
         if is_entry {
-            let exit_side = match direction {
-                Direction::Long => OrderSide::Sell,
-                Direction::Short => OrderSide::Buy,
-            };
-            if Self::can_place_maker(exit_side, exit_price, best_bid, best_ask) {
-                let next_cloid = self.next_client_order_id(slot_idx, false);
-                self.slots[slot_idx].state = SlotState::ExitWorking {
-                    client_order_id: next_cloid,
-                };
-                self.order_to_slot.insert(next_cloid, (slot_idx, false));
-                intents.push(GridOrderIntent {
-                    slot_index: slot_idx,
-                    client_order_id: next_cloid,
-                    side: exit_side,
-                    price: exit_price,
-                    quantity,
-                    post_only,
-                    reduce_only: true,
-                    is_entry: false,
-                });
-            } else {
-                self.slots[slot_idx].state = SlotState::HoldingWaitingExit;
-            }
+            self.slots[slot_idx].state = SlotState::HoldingWaitingExit;
         } else {
-            // Exit order filled -> completed one full grid arbitrage cycle!
             let spread = (exit_price - entry_price).abs();
             self.slots[slot_idx].completed_cycles += 1;
             self.slots[slot_idx].realized_gross_pnl_usdc += quantity * spread;
-
-            let entry_side = match direction {
-                Direction::Long => OrderSide::Buy,
-                Direction::Short => OrderSide::Sell,
-            };
-            if Self::can_place_maker(entry_side, entry_price, best_bid, best_ask) {
-                let next_cloid = self.next_client_order_id(slot_idx, true);
-                self.slots[slot_idx].state = SlotState::EntryWorking {
-                    client_order_id: next_cloid,
-                };
-                self.order_to_slot.insert(next_cloid, (slot_idx, true));
-                intents.push(GridOrderIntent {
-                    slot_index: slot_idx,
-                    client_order_id: next_cloid,
-                    side: entry_side,
-                    price: entry_price,
-                    quantity,
-                    post_only,
-                    reduce_only: false,
-                    is_entry: true,
-                });
-            } else {
-                self.slots[slot_idx].state = SlotState::Idle;
-            }
+            self.slots[slot_idx].state = SlotState::Idle;
         }
 
-        intents
+        self.on_market_price(best_bid, best_ask)
     }
 
     /// Called when an order is rejected (e.g., Post-Only ALO crossing reject) or canceled before filling.
@@ -441,6 +434,7 @@ mod tests {
             amount_per_grid: 1000.0,
             post_only: true,
             follow_price_into_idle_grids: true,
+            active_entry_grids: 0,
         }
     }
 
@@ -450,7 +444,8 @@ mod tests {
         assert_eq!(engine.slots().len(), 30);
 
         // Current market price 60.12 (best_bid = 60.11, best_ask = 60.13)
-        let intents = engine.on_market_price(60.11, 60.13);
+        let plan = engine.on_market_price(60.11, 60.13);
+        let intents = plan.orders_to_place;
 
         // Levels below 60.12 are P_0 (55.0) through P_15 (60.0) -> 16 Buy orders
         assert_eq!(intents.len(), 16);
@@ -469,15 +464,15 @@ mod tests {
     #[test]
     fn buy_fill_places_maker_reduce_only_sell_one_grid_higher_and_sell_fill_rearms_buy() {
         let mut engine = GridEngine::new(sample_hype_long_config(), 2).expect("valid engine");
-        let intents = engine.on_market_price(60.11, 60.13);
-        let top_buy = intents.last().expect("slot 15 buy at 60.0").clone();
+        let plan = engine.on_market_price(60.11, 60.13);
+        let top_buy = plan.orders_to_place.last().expect("slot 15 buy at 60.0").clone();
         assert_eq!(top_buy.slot_index, 15);
         assert!((top_buy.price - 60.0).abs() < 1e-6);
 
         // Price dips to 59.95 / 59.98 and fills slot 15 buy order at 60.0
-        let exit_intents = engine.on_order_filled(&top_buy.client_order_id, 59.95, 59.98);
-        assert_eq!(exit_intents.len(), 1);
-        let sell_order = &exit_intents[0];
+        let exit_plan = engine.on_order_filled(&top_buy.client_order_id, 59.95, 59.98);
+        assert_eq!(exit_plan.orders_to_place.len(), 1);
+        let sell_order = &exit_plan.orders_to_place[0];
         assert_eq!(sell_order.slot_index, 15);
         assert_eq!(sell_order.side, OrderSide::Sell);
         assert!(sell_order.post_only);
@@ -487,9 +482,9 @@ mod tests {
         assert!((sell_order.quantity - top_buy.quantity).abs() < 1e-9);
 
         // Now price rallies to 60.35 / 60.37 and fills the Sell order at 60.333
-        let rearm_intents = engine.on_order_filled(&sell_order.client_order_id, 60.35, 60.37);
-        assert_eq!(rearm_intents.len(), 1);
-        let rearmed_buy = &rearm_intents[0];
+        let rearm_plan = engine.on_order_filled(&sell_order.client_order_id, 60.35, 60.37);
+        assert_eq!(rearm_plan.orders_to_place.len(), 1);
+        let rearmed_buy = &rearm_plan.orders_to_place[0];
         assert_eq!(rearmed_buy.slot_index, 15);
         assert_eq!(rearmed_buy.side, OrderSide::Buy);
         assert!(rearmed_buy.post_only);
@@ -505,7 +500,8 @@ mod tests {
     #[test]
     fn drop_to_55_00_accumulates_expected_position_and_unrealized_loss() {
         let mut engine = GridEngine::new(sample_hype_long_config(), 2).expect("valid engine");
-        let intents = engine.on_market_price(60.11, 60.13);
+        let plan = engine.on_market_price(60.11, 60.13);
+        let intents = plan.orders_to_place;
         assert_eq!(intents.len(), 16);
 
         // Simulate price dropping all the way to 55.00, filling all 16 Buy orders
@@ -518,5 +514,36 @@ mod tests {
         // Total base quantity ~278.34 HYPE, unrealized PnL at 55.00 ~ -687 USDC
         assert!(summary.total_position_base_qty > 278.0 && summary.total_position_base_qty < 279.0);
         assert!(summary.unrealized_pnl_usdc < -685.0 && summary.unrealized_pnl_usdc > -690.0);
+    }
+
+    #[test]
+    fn active_entry_grids_limits_to_3_and_replenishes_on_fill() {
+        let mut cfg = sample_hype_long_config();
+        cfg.active_entry_grids = 3;
+        let mut engine = GridEngine::new(cfg, 2).expect("valid engine");
+
+        let plan = engine.on_market_price(60.11, 60.13);
+        // Only 3 entry orders should be placed initially (slots 13, 14, 15)
+        assert_eq!(plan.orders_to_place.len(), 3);
+        assert_eq!(plan.orders_to_place[0].slot_index, 13);
+        assert_eq!(plan.orders_to_place[1].slot_index, 14);
+        assert_eq!(plan.orders_to_place[2].slot_index, 15);
+
+        let slot_15_order = plan.orders_to_place.iter().find(|o| o.slot_index == 15).cloned().unwrap();
+
+        // Price dips and fills slot 15 at 60.00
+        let fill_plan = engine.on_order_filled(&slot_15_order.client_order_id, 59.95, 59.98);
+
+        // fill_plan should place Exit order for slot 15 AND replenish next lower entry grid (slot 12)!
+        assert_eq!(fill_plan.orders_to_place.len(), 2);
+        let has_exit_15 = fill_plan.orders_to_place.iter().any(|o| o.slot_index == 15 && !o.is_entry && o.reduce_only);
+        let has_entry_12 = fill_plan.orders_to_place.iter().any(|o| o.slot_index == 12 && o.is_entry);
+        assert!(has_exit_15, "Must place Exit order for slot 15");
+        assert!(has_entry_12, "Must replenish next lower entry grid (slot 12)");
+
+        let summary = engine.summary_metrics(59.98);
+        assert_eq!(summary.active_entry_orders, 3); // slots 12, 13, 14
+        assert_eq!(summary.active_exit_orders, 1);  // slot 15
+        assert_eq!(summary.holding_slots, 1);
     }
 }

@@ -1,6 +1,6 @@
 use crate::{
     config::AppConfig,
-    grid::{GridEngine, GridOrderIntent, SlotState},
+    grid::{GridActionPlan, GridEngine, GridOrderIntent, SlotState},
     precision::{format_hl_price, format_hl_size},
 };
 use anyhow::{Context, Result, bail};
@@ -161,10 +161,10 @@ impl LiveGridRunner {
             "Fetched initial Hyperliquid order book BBO"
         );
 
-        let initial_intents = grid.on_market_price(best_bid, best_ask);
+        let initial_plan = grid.on_market_price(best_bid, best_ask);
         let summary = grid.summary_metrics(initial_mid);
         info!(
-            initial_orders_to_place = initial_intents.len(),
+            initial_orders_to_place = initial_plan.orders_to_place.len(),
             total_working_notional_usdc = format!("{:.2}", summary.total_working_entry_notional_usdc),
             "Computed initial Maker grid order layout"
         );
@@ -180,19 +180,30 @@ impl LiveGridRunner {
                 best_bid, best_ask, initial_mid
             );
             println!(
-                "Direction: {:?} | Range: [{}, {}] | Grids: {} | Per Grid: {} USDC | Maker Only: {}",
+                "Direction: {:?} | Range: [{}, {}] | Grids: {} | Per Grid: {} USDC | Maker Only: {} | Active Window: {}",
                 self.cfg.grid.direction,
                 self.cfg.grid.lower_price,
                 self.cfg.grid.upper_price,
                 self.cfg.grid.grid_count,
                 self.cfg.grid.amount_per_grid,
-                self.cfg.grid.post_only
+                self.cfg.grid.post_only,
+                if self.cfg.grid.active_entry_grids == 0 {
+                    "All (Unlimited)".to_string()
+                } else {
+                    format!("{} grids", self.cfg.grid.active_entry_grids)
+                }
             );
             println!("------------------------------------------------------------");
             for slot in grid.slots() {
                 let status_str = match &slot.state {
-                    SlotState::Idle => "IDLE (Above Market)",
-                    SlotState::EntryWorking { .. } => "MAKER ENTRY ARMED",
+                    SlotState::Idle => {
+                        if slot.entry_price < initial_mid {
+                            "IDLE (Below Active Window)"
+                        } else {
+                            "IDLE (Above Market)"
+                        }
+                    }
+                    SlotState::EntryWorking { .. } => "MAKER ENTRY ARMED (Active Window)",
                     SlotState::HoldingWaitingExit => "HOLDING (WAIT EXIT)",
                     SlotState::ExitWorking { .. } => "MAKER EXIT ARMED",
                 };
@@ -260,24 +271,14 @@ impl LiveGridRunner {
             .context("Failed to subscribe to user orderUpdates and userEvents")?;
 
         info!("WebSocket streams active; placing initial Maker grid orders...");
-        let mut initial_to_place = initial_intents;
-        initial_to_place.retain(|intent| {
-            if let Some(retry_at) = slot_cooldowns.get(&intent.slot_index) {
-                if Instant::now() < *retry_at {
-                    return false;
-                }
-            }
-            true
-        });
-
-        self.dispatch_intents(
+        self.dispatch_plan(
             &ws_client,
             &http_client,
             instrument_id,
             sz_decimals,
             &mut grid,
             &mut slot_cooldowns,
-            initial_to_place,
+            initial_plan,
         )
         .await;
 
@@ -302,24 +303,16 @@ impl LiveGridRunner {
                                 if bid > 0.0 && ask > 0.0 {
                                     best_bid = bid;
                                     best_ask = ask;
-                                    let mut intents = grid.on_market_price(best_bid, best_ask);
-                                    intents.retain(|intent| {
-                                        if let Some(retry_at) = slot_cooldowns.get(&intent.slot_index) {
-                                            if Instant::now() < *retry_at {
-                                                return false;
-                                            }
-                                        }
-                                        true
-                                    });
-                                    if !intents.is_empty() {
-                                        self.dispatch_intents(
+                                    let plan = grid.on_market_price(best_bid, best_ask);
+                                    if !plan.is_empty() {
+                                        self.dispatch_plan(
                                             &ws_client,
                                             &http_client,
                                             instrument_id,
                                             sz_decimals,
                                             &mut grid,
                                             &mut slot_cooldowns,
-                                            intents,
+                                            plan,
                                         )
                                         .await;
                                     }
@@ -345,7 +338,7 @@ impl LiveGridRunner {
                                                     filled_qty = %order_report.filled_qty,
                                                     "Grid Maker order FILLED"
                                                 );
-                                                let next_intents = grid.on_order_filled(&cloid, best_bid, best_ask);
+                                                let fill_plan = grid.on_order_filled(&cloid, best_bid, best_ask);
                                                 let metrics = grid.summary_metrics((best_bid + best_ask) * 0.5);
                                                 info!(
                                                     completed_cycles = metrics.completed_cycles,
@@ -356,15 +349,15 @@ impl LiveGridRunner {
                                                     active_exits = metrics.active_exit_orders,
                                                     "Grid status updated after fill"
                                                 );
-                                                if !next_intents.is_empty() {
-                                                    self.dispatch_intents(
+                                                if !fill_plan.is_empty() {
+                                                    self.dispatch_plan(
                                                         &ws_client,
                                                         &http_client,
                                                         instrument_id,
                                                         sz_decimals,
                                                         &mut grid,
                                                         &mut slot_cooldowns,
-                                                        next_intents,
+                                                        fill_plan,
                                                     )
                                                     .await;
                                                 }
@@ -418,24 +411,16 @@ impl LiveGridRunner {
                     {
                         best_bid = bid;
                         best_ask = ask;
-                        let mut intents = grid.on_market_price(best_bid, best_ask);
-                        intents.retain(|intent| {
-                            if let Some(retry_at) = slot_cooldowns.get(&intent.slot_index) {
-                                if Instant::now() < *retry_at {
-                                    return false;
-                                }
-                            }
-                            true
-                        });
-                        if !intents.is_empty() {
-                            self.dispatch_intents(
+                        let plan = grid.on_market_price(best_bid, best_ask);
+                        if !plan.is_empty() {
+                            self.dispatch_plan(
                                 &ws_client,
                                 &http_client,
                                 instrument_id,
                                 sz_decimals,
                                 &mut grid,
                                 &mut slot_cooldowns,
-                                intents,
+                                plan,
                             )
                             .await;
                         }
@@ -484,6 +469,53 @@ impl LiveGridRunner {
         }
 
         (perp_margin, spot_usdc)
+    }
+
+    async fn dispatch_plan(
+        &self,
+        ws_client: &HyperliquidWebSocketClient,
+        http_client: &HyperliquidHttpClient,
+        instrument_id: InstrumentId,
+        sz_decimals: u8,
+        grid: &mut GridEngine,
+        slot_cooldowns: &mut HashMap<usize, Instant>,
+        plan: GridActionPlan,
+    ) {
+        if !plan.orders_to_cancel.is_empty() {
+            let cancels: Vec<(InstrumentId, ClientOrderId, Option<_>)> = plan
+                .orders_to_cancel
+                .iter()
+                .map(|(_, cloid)| (instrument_id, *cloid, None))
+                .collect();
+            info!(count = cancels.len(), "Canceling orders that left the active window");
+            if let Err(e) = ws_client.cancel_orders(http_client, &cancels).await {
+                warn!(error = %e, "Failed to cancel orders outside active window");
+            }
+        }
+
+        if !plan.orders_to_place.is_empty() {
+            let mut to_place = plan.orders_to_place;
+            to_place.retain(|intent| {
+                if let Some(retry_at) = slot_cooldowns.get(&intent.slot_index) {
+                    if Instant::now() < *retry_at {
+                        return false;
+                    }
+                }
+                true
+            });
+            if !to_place.is_empty() {
+                self.dispatch_intents(
+                    ws_client,
+                    http_client,
+                    instrument_id,
+                    sz_decimals,
+                    grid,
+                    slot_cooldowns,
+                    to_place,
+                )
+                .await;
+            }
+        }
     }
 
     async fn dispatch_intents(

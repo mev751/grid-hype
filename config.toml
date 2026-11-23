@@ -25,6 +25,10 @@ post_only = true
 # 动态上方补单: 当价格上涨突破空闲网格时，是否自动在现价下方新解锁的档位挂出 Maker 开仓单
 follow_price_into_idle_grids = true
 
+# 现价下方最大同时激活的开仓挂单数 (默认 3，0 表示不限制/挂满全部下方网格)
+# 仅在现价下方维持最近的 N 格挂单，成交一格补一格，大幅节省保证金占用
+active_entry_grids = 3
+
 [exchange]
 # 是否使用 Hyperliquid 测试网 (false = 主网 Mainnet, true = 测试网 Testnet)
 testnet = false

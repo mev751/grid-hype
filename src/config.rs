@@ -21,6 +21,8 @@ pub struct GridConfig {
     pub post_only: bool,
     #[serde(default = "default_true")]
     pub follow_price_into_idle_grids: bool,
+    #[serde(default = "default_active_entry_grids")]
+    pub active_entry_grids: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +55,10 @@ pub struct AppConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_active_entry_grids() -> usize {
+    3
 }
 
 fn default_pk_env() -> String {
