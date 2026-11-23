@@ -35,7 +35,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          RUST_BACKTRACE=1 cargo test --verbose -- --nocapture 2>&1 | tee test_output.log || {
+          RUST_BACKTRACE=1 cargo test --all-targets --verbose -- --nocapture 2>&1 | tee test_output.log || {
             echo "## ❌ Unit Tests Failed" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
             tail -n 120 test_output.log >> $GITHUB_STEP_SUMMARY
@@ -49,7 +49,13 @@ jobs:
 
       - name: Build Release Binary (x86_64-unknown-linux-gnu)
         run: |
-          cargo build --release --target x86_64-unknown-linux-gnu
+          RUST_BACKTRACE=1 cargo build --release --target x86_64-unknown-linux-gnu 2>&1 | tee build_output.log || {
+            echo "## ❌ Build Failed" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -n 150 build_output.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            exit 1
+          }
           mkdir -p dist
           cp target/x86_64-unknown-linux-gnu/release/grid-hype dist/grid-hype
           cp config.toml dist/config.toml
