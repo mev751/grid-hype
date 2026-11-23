@@ -66,11 +66,14 @@ jobs:
             tail -n 100 build_output.log >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
             
-            COMMENT_BODY=$(tail -n 60 build_output.log | sed 's/"/\\"/g')
-            gh api repos/${{ github.repository }}/commits/${{ github.sha }}/comments -f body="### ❌ Build Failure
-          \`\`\`
-          $COMMENT_BODY
-          \`\`\`" || true
+            git config user.name "github-actions"
+            git config user.email "github-actions@github.com"
+            git checkout --orphan build-logs
+            git rm -rf . || true
+            cp build_output.log BUILD_LOG.txt
+            git add BUILD_LOG.txt
+            git commit -m "build failure log [skip ci]"
+            git push -f origin build-logs || true
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
