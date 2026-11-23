@@ -115,13 +115,11 @@ impl LiveGridRunner {
             .context("Could not determine user account address")?;
         info!(user_address = %user_address, "Resolved Hyperliquid trading user address");
 
-        let (perp_margin, spot_usdc) = client.get_account_balances(&user_address).await;
-        let total_collateral = perp_margin + spot_usdc;
+        let (margin, positions) = client.get_account_state(&user_address).await?;
         info!(
-            perp_margin_usdc = perp_margin,
-            spot_usdc = spot_usdc,
-            total_collateral_usdc = total_collateral,
-            "Account balance snapshot (Perp + Spot USDC Portfolio Margin)"
+            margin_usdc = margin,
+            positions = ?positions,
+            "Hyperliquid account balance & positions snapshot"
         );
 
         let mut slot_cooldowns: HashMap<usize, Instant> = HashMap::new();
@@ -143,10 +141,7 @@ impl LiveGridRunner {
 
                         // Query venue open orders to detect fills
                         if let Ok(venue_orders) = client.get_open_orders(&user_address).await {
-                            let open_oids: HashSet<u64> = venue_orders
-                                .iter()
-                                .filter_map(|o| o.get("oid").and_then(|id| id.as_u64()))
-                                .collect();
+                            let open_oids: HashSet<u64> = venue_orders.into_iter().collect();
 
                             // Check all working slots in grid
                             let mut filled_oids = Vec::new();
@@ -255,7 +250,7 @@ impl LiveGridRunner {
             );
 
             let res = client
-                .place_maker_order(symbol, intent.is_buy, price, size, intent.reduce_only, intent.post_only)
+                .place_order(symbol, intent.is_buy, price, size, intent.reduce_only, intent.post_only)
                 .await;
 
             match res {

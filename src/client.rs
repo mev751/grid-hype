@@ -221,7 +221,7 @@ impl HyperliquidClient {
         match response {
             Ok(ExchangeResponseStatus::Ok(order_res)) => {
                 debug!(?order_res, "Order response from Hyperliquid");
-                if let Some(data) = order_res.data {
+                if let Some(ref data) = order_res.data {
                     if !data.statuses.is_empty() {
                         match &data.statuses[0] {
                             ExchangeDataStatus::Resting(r) => return Ok(r.oid),
