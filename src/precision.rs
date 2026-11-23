@@ -1,51 +1,38 @@
-use nautilus_hyperliquid::common::parse::{normalize_price, normalize_quantity};
-use rust_decimal::{Decimal, prelude::ToPrimitive};
-use std::str::FromStr;
-
-/// Hyperliquid Perpetual max price decimals = `max(0, 6 - sz_decimals)`.
-pub fn perp_price_decimals(sz_decimals: u8) -> u8 {
-    6_u8.saturating_sub(sz_decimals)
+/// Formats and rounds price for Hyperliquid perp markets.
+/// Hyperliquid requires max 5 significant figures and respects tick size.
+pub fn format_hl_price(price: f64, sz_decimals: u8) -> String {
+    let max_decimals = (6u8.saturating_sub(sz_decimals)).min(4) as usize;
+    if price >= 10000.0 {
+        format!("{:.1}", (price * 10.0).round() / 10.0)
+    } else if price >= 1000.0 {
+        format!("{:.2}", (price * 100.0).round() / 100.0)
+    } else if price >= 100.0 {
+        format!("{:.3}", (price * 1000.0).round() / 1000.0)
+    } else if price >= 10.0 {
+        // e.g. HYPE at 63.333 -> 3 decimals (5 sig figs)
+        let dec = max_decimals.min(3);
+        let factor = 10f64.powi(dec as i32);
+        format!("{:.prec$}", (price * factor).round() / factor, prec = dec)
+    } else {
+        let dec = max_decimals.min(4);
+        let factor = 10f64.powi(dec as i32);
+        format!("{:.prec$}", (price * factor).round() / factor, prec = dec)
+    }
 }
 
-/// Rounds a perpetual price according to Hyperliquid's official NautilusTrader rules:
-/// 1. At most 5 significant figures (`round_to_sig_figs(price, 5)`).
-/// 2. At most `(6 - sz_decimals)` decimal places.
-pub fn round_hl_price_decimal(price: f64, sz_decimals: u8) -> Decimal {
-    if !price.is_finite() || price <= 0.0 {
-        return Decimal::ZERO;
-    }
-    let raw = Decimal::from_str(&format!("{price:.8}")).unwrap_or(Decimal::ZERO);
-    let price_decimals = perp_price_decimals(sz_decimals);
-    normalize_price(raw, price_decimals).normalize()
+/// Formats and rounds size for Hyperliquid perp markets according to `sz_decimals`.
+pub fn format_hl_size(size: f64, sz_decimals: u8) -> String {
+    let factor = 10f64.powi(sz_decimals as i32);
+    let rounded = (size * factor).floor() / factor;
+    format!("{:.prec$}", rounded, prec = sz_decimals as usize)
 }
 
 pub fn round_hl_price(price: f64, sz_decimals: u8) -> f64 {
-    round_hl_price_decimal(price, sz_decimals)
-        .to_f64()
-        .unwrap_or(0.0)
-}
-
-pub fn format_hl_price(price: f64, sz_decimals: u8) -> String {
-    round_hl_price_decimal(price, sz_decimals).to_string()
-}
-
-/// Rounds a perpetual order size to `sz_decimals` decimal places.
-pub fn round_hl_size_decimal(size: f64, sz_decimals: u8) -> Decimal {
-    if !size.is_finite() || size <= 0.0 {
-        return Decimal::ZERO;
-    }
-    let raw = Decimal::from_str(&format!("{size:.8}")).unwrap_or(Decimal::ZERO);
-    normalize_quantity(raw, sz_decimals).normalize()
+    format_hl_price(price, sz_decimals).parse::<f64>().unwrap_or(price)
 }
 
 pub fn round_hl_size(size: f64, sz_decimals: u8) -> f64 {
-    round_hl_size_decimal(size, sz_decimals)
-        .to_f64()
-        .unwrap_or(0.0)
-}
-
-pub fn format_hl_size(size: f64, sz_decimals: u8) -> String {
-    round_hl_size_decimal(size, sz_decimals).to_string()
+    format_hl_size(size, sz_decimals).parse::<f64>().unwrap_or(size)
 }
 
 #[cfg(test)]
@@ -53,19 +40,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn formats_hyperliquid_perp_prices_to_5_sig_figs_and_max_decimals() {
-        // For HYPE-PERP (sz_decimals = 2), max price decimals = 6 - 2 = 4, and 5 sig figs:
-        // 55.33333333 -> 5 sig figs is 55.333 (3 decimal places <= 4)
-        assert_eq!(format_hl_price(55.0, 2), "55");
-        assert_eq!(format_hl_price(55.333333333, 2), "55.333");
-        assert_eq!(format_hl_price(60.12, 2), "60.12");
-        assert_eq!(format_hl_price(64.666666667, 2), "64.667");
-    }
-
-    #[test]
-    fn formats_hyperliquid_perp_sizes_to_sz_decimals() {
-        // 1000.0 / 55.0 = 18.181818... -> sz_decimals = 2 -> 18.18
-        assert_eq!(format_hl_size(1000.0 / 55.0, 2), "18.18");
-        assert!((round_hl_size(1000.0 / 55.0, 2) - 18.18).abs() < 1e-9);
+    fn test_precision_hype_formatting() {
+        assert_eq!(format_hl_price(63.3333333, 2), "63.333");
+        assert_eq!(format_hl_price(60.0, 2), "60.000");
+        assert_eq!(format_hl_size(15.87654, 2), "15.87");
+        assert_eq!(format_hl_size(4.7619, 2), "4.76");
     }
 }

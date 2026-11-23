@@ -1,26 +1,25 @@
 [package]
 name = "grid-hype"
-version = "0.1.0"
-edition = "2024"
-description = "Generalized Hyperliquid Maker Grid Arbitrage Engine built on NautilusTrader (Rust)"
+version = "0.2.0"
+edition = "2021"
+description = "Generic Hyperliquid Maker Grid Arbitrage Engine in Native Rust"
 license = "MIT"
 
 [dependencies]
-nautilus-hyperliquid = "0.68.0"
-nautilus-model = "0.68.0"
-nautilus-core = "0.68.0"
-nautilus-common = "0.68.0"
-nautilus-network = "0.68.0"
-rust_decimal = "1.36"
+hyperliquid_rust_sdk = "0.6.0"
+ethers = { version = "2.0", default-features = false, features = ["rustls"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = "1.0"
 toml = "0.8"
-anyhow = "1"
+anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

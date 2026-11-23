@@ -1,55 +1,43 @@
 # =============================================================================
-# Grid-HYPE: NautilusTrader Hyperliquid Maker Grid Arbitrage Configuration
+# Hyperliquid Generic Grid Arbitrage Bot (Native Rust)
 # =============================================================================
 
 [grid]
-# 交易币种 (Hyperliquid 永续合约标的，如 "HYPE" 对应 "HYPE-PERP")
+# 标的代币 (Hyperliquid 永续合约, 例如 "HYPE")
 symbol = "HYPE"
 
 # 网格方向: "long" (做多网格) 或 "short" (做空网格)
 direction = "long"
 
-# 网格价格区间下限与上限 (USDC)
+# 价格区间 (USDC): 55.0 到 65.0
 lower_price = 55.0
 upper_price = 65.0
 
-# 网格数量 (划分 30 格，即 31 个价格档位，每格间距 = (65 - 55) / 30 = 0.333333 USDC)
+# 网格数量: 划分 30 格 (每格间距 = (65 - 55) / 30 = 0.333333 USDC)
 grid_count = 30
 
-# 每格下单名义金额 (USDC)
+# 每格下单金额: 1000 USDC
 amount_per_grid = 1000.0
 
 # 开仓与平仓均强制使用 Maker (Post-Only / ALO) 节省手续费
 post_only = true
 
-# 动态上方补单: 当价格上涨突破空闲网格时，是否自动在现价下方新解锁的档位挂出 Maker 开仓单
-follow_price_into_idle_grids = true
-
 # 现价下方最大同时激活的开仓挂单数 (默认 3，0 表示不限制/挂满全部下方网格)
-# 仅在现价下方维持最近的 N 格挂单，成交一格补一格，大幅节省保证金占用
+# 仅在现价下方维持最近的 3 格挂单，成交一格再挂一格，大幅节省保证金占用
 active_entry_grids = 3
 
 [exchange]
-# 是否使用 Hyperliquid 测试网 (false = 主网 Mainnet, true = 测试网 Testnet)
+# 是否使用测试网 (false = 主网 Mainnet, true = 测试网 Testnet)
 testnet = false
 
-# 导出私钥的环境变量名 (也可回退读取 PRIVATE_KEY)
+# 私钥环境变量名 (优先读取 HYPERLIQUID_PK，备用 PRIVATE_KEY)
 private_key_env = "HYPERLIQUID_PK"
 
-# 可选: Vault 或子账户地址环境变量名
-vault_address_env = "HYPERLIQUID_VAULT"
+# 主账户地址 (使用 API/Agent 钱包交易时指定持有资金的主账户地址)
+account_address = "0x716ce5802be364b1fc17d45bd89ce8bc657ea787"
 
-# 可选: 主账户地址环境变量名 (使用 API/Agent 钱包交易时指定持有资金的主账户地址)
-account_address_env = "HYPERLIQUID_ACCOUNT_ADDRESS"
-
-# 可选: 直接配置主账户地址 (如果配置了此项，使用 API 钱包时无需再额外配置环境变量)
-# account_address = "0x716ce5802be364b1fc17d45bd89ce8bc657ea787"
-
-# 请求超时时间 (秒)
-http_timeout_secs = 15
-
-# 状态巡检与漏单补挂周期 (秒)
-reconcile_interval_secs = 10
+# 状态巡检与订单对账周期 (秒)
+reconcile_interval_secs = 5
 
 # 程序退出时是否自动撤销所有当前挂单
 cancel_on_exit = false

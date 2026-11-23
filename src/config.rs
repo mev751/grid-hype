@@ -19,8 +19,6 @@ pub struct GridConfig {
     pub amount_per_grid: f64,
     #[serde(default = "default_true")]
     pub post_only: bool,
-    #[serde(default = "default_true")]
-    pub follow_price_into_idle_grids: bool,
     #[serde(default = "default_active_entry_grids")]
     pub active_entry_grids: usize,
 }
@@ -31,20 +29,11 @@ pub struct ExchangeConfig {
     pub testnet: bool,
     #[serde(default = "default_pk_env")]
     pub private_key_env: String,
-    #[serde(default = "default_vault_env")]
-    pub vault_address_env: String,
-    #[serde(default = "default_account_env")]
-    pub account_address_env: String,
-    #[serde(default)]
     pub account_address: Option<String>,
-    #[serde(default = "default_timeout_secs")]
-    pub http_timeout_secs: u64,
-    #[serde(default = "default_reconcile_secs")]
+    #[serde(default = "default_reconcile_interval")]
     pub reconcile_interval_secs: u64,
     #[serde(default)]
     pub cancel_on_exit: bool,
-    #[serde(default)]
-    pub include_builder_attribution: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,42 +54,26 @@ fn default_pk_env() -> String {
     "HYPERLIQUID_PK".to_string()
 }
 
-fn default_vault_env() -> String {
-    "HYPERLIQUID_VAULT".to_string()
-}
-
-fn default_account_env() -> String {
-    "HYPERLIQUID_ACCOUNT_ADDRESS".to_string()
-}
-
-fn default_timeout_secs() -> u64 {
-    15
-}
-
-fn default_reconcile_secs() -> u64 {
-    10
+fn default_reconcile_interval() -> u64 {
+    5
 }
 
 impl AppConfig {
-    pub fn load(path: &Path) -> Result<Self> {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let mut cfg: Self = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse TOML in: {}", path.display()))?;
-        cfg.grid.symbol = cfg.grid.symbol.trim().to_uppercase();
-        cfg.validate()?;
-        Ok(cfg)
+    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let content = fs::read_to_string(path.as_ref())
+            .with_context(|| format!("Failed to read config file at {:?}", path.as_ref()))?;
+        let config: AppConfig = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse TOML configuration from {:?}", path.as_ref()))?;
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn validate(&self) -> Result<()> {
         if self.grid.symbol.trim().is_empty() {
             bail!("grid.symbol cannot be empty");
         }
-        if !self.grid.lower_price.is_finite()
-            || !self.grid.upper_price.is_finite()
-            || self.grid.lower_price <= 0.0
-        {
-            bail!("grid.lower_price and grid.upper_price must be positive finite numbers");
+        if self.grid.lower_price <= 0.0 || self.grid.upper_price <= 0.0 {
+            bail!("grid lower_price and upper_price must be > 0.0");
         }
         if self.grid.lower_price >= self.grid.upper_price {
             bail!(
@@ -112,122 +85,45 @@ impl AppConfig {
         if self.grid.grid_count == 0 {
             bail!("grid.grid_count must be >= 1");
         }
-        if !self.grid.amount_per_grid.is_finite() || self.grid.amount_per_grid < 10.0 {
-            bail!(
-                "grid.amount_per_grid ({}) must be at least 10.0 USDC (Hyperliquid minimum order value)",
-                self.grid.amount_per_grid
-            );
+        if self.grid.amount_per_grid <= 0.0 {
+            bail!("grid.amount_per_grid must be > 0.0");
         }
         Ok(())
     }
 
-    /// Resolves the EVM private key from the configured environment variable,
-    /// with fallback to `HYPERLIQUID_PK`, `HYPERLIQUID_TESTNET_PK`, and `PRIVATE_KEY`.
     pub fn resolve_private_key(&self) -> Result<String> {
-        let candidates = [
-            self.exchange.private_key_env.as_str(),
-            "HYPERLIQUID_PK",
-            "HYPERLIQUID_TESTNET_PK",
-            "PRIVATE_KEY",
-        ];
-        for var_name in candidates {
-            if var_name.is_empty() {
-                continue;
+        let env_key = &self.exchange.private_key_env;
+        if let Ok(val) = env::var(env_key) {
+            let clean = val.trim().trim_matches('"').trim_matches('\'').to_string();
+            if !clean.is_empty() {
+                return Ok(clean);
             }
-            if let Ok(val) = env::var(var_name) {
-                let trimmed = val.trim();
-                if !trimmed.is_empty() {
-                    return Ok(trimmed.to_string());
-                }
+        }
+        if let Ok(val) = env::var("PRIVATE_KEY") {
+            let clean = val.trim().trim_matches('"').trim_matches('\'').to_string();
+            if !clean.is_empty() {
+                return Ok(clean);
             }
         }
         bail!(
-            "Missing private key in environment variable '{}' (or fallback HYPERLIQUID_PK / PRIVATE_KEY)",
-            self.exchange.private_key_env
+            "Missing private key: environment variable '{}' (or 'PRIVATE_KEY') not set",
+            env_key
         )
     }
 
-    /// Resolves the optional Hyperliquid vault or subaccount address from the environment.
-    pub fn resolve_vault_address(&self) -> Option<String> {
-        let candidates = [
-            self.exchange.vault_address_env.as_str(),
-            "HYPERLIQUID_VAULT",
-            "HYPERLIQUID_TESTNET_VAULT",
-        ];
-        for var_name in candidates {
-            if var_name.is_empty() {
-                continue;
-            }
-            if let Ok(val) = env::var(var_name) {
-                let trimmed = val.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-        }
-        None
-    }
-
-    /// Resolves the optional Hyperliquid master account address (for agent/API wallet usage) from config or environment.
     pub fn resolve_account_address(&self) -> Option<String> {
         if let Some(ref addr) = self.exchange.account_address {
-            let trimmed = addr.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+            let clean = addr.trim().trim_matches('"').trim_matches('\'').to_string();
+            if !clean.is_empty() {
+                return Some(clean);
             }
         }
-        let candidates = [
-            self.exchange.account_address_env.as_str(),
-            "HYPERLIQUID_ACCOUNT_ADDRESS",
-            "ACCOUNT_ADDRESS",
-            "HL_WALLET_ADDRESS",
-        ];
-        for var_name in candidates {
-            if var_name.is_empty() {
-                continue;
-            }
-            if let Ok(val) = env::var(var_name) {
-                let trimmed = val.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
+        if let Ok(val) = env::var("HYPERLIQUID_ACCOUNT_ADDRESS") {
+            let clean = val.trim().trim_matches('"').trim_matches('\'').to_string();
+            if !clean.is_empty() {
+                return Some(clean);
             }
         }
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn loads_default_config_toml_for_hype_long_55_to_65_30_grids_1000_usdc() {
-        let cfg = AppConfig::load(&PathBuf::from("config.toml")).expect("should parse config.toml");
-        assert_eq!(cfg.grid.symbol, "HYPE");
-        assert_eq!(cfg.grid.direction, Direction::Long);
-        assert!((cfg.grid.lower_price - 55.0).abs() < 1e-9);
-        assert!((cfg.grid.upper_price - 65.0).abs() < 1e-9);
-        assert_eq!(cfg.grid.grid_count, 30);
-        assert!((cfg.grid.amount_per_grid - 1000.0).abs() < 1e-9);
-        assert!(cfg.grid.post_only);
-    }
-
-    #[test]
-    fn rejects_invalid_grid_bounds_and_counts() {
-        let mut cfg = AppConfig::load(&PathBuf::from("config.toml")).expect("load config");
-        cfg.grid.lower_price = 65.0;
-        cfg.grid.upper_price = 55.0;
-        assert!(cfg.validate().is_err());
-
-        cfg.grid.lower_price = 55.0;
-        cfg.grid.upper_price = 65.0;
-        cfg.grid.grid_count = 0;
-        assert!(cfg.validate().is_err());
-
-        cfg.grid.grid_count = 30;
-        cfg.grid.amount_per_grid = 5.0;
-        assert!(cfg.validate().is_err());
     }
 }

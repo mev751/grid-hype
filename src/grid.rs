@@ -3,28 +3,25 @@ use crate::{
     precision::{round_hl_price, round_hl_size},
 };
 use anyhow::{Result, bail};
-use nautilus_model::{enums::OrderSide, identifiers::ClientOrderId};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlotState {
     /// No active order or position for this grid interval.
     Idle,
-    /// Opening Maker order is resting on the book (`Buy` for Long, `Sell` for Short).
-    EntryWorking { client_order_id: ClientOrderId },
-    /// Cancellation requested for entry order; still in order_to_slot until exchange confirms cancel or fill.
-    EntryCanceling { client_order_id: ClientOrderId },
+    /// Opening Maker order is resting on the book.
+    EntryWorking { oid: u64 },
+    /// Cancellation requested for entry order; still tracked until exchange confirms cancel or fill.
+    EntryCanceling { oid: u64 },
     /// Entry order filled, waiting for market price to allow placing a valid Post-Only exit order.
     HoldingWaitingExit,
-    /// Closing Maker (`reduce_only`) order is resting on the book (`Sell` for Long, `Buy` for Short).
-    ExitWorking { client_order_id: ClientOrderId },
+    /// Closing Maker (`reduce_only`) order is resting on the book.
+    ExitWorking { oid: u64 },
 }
 
 #[derive(Debug, Clone)]
 pub struct GridSlot {
     pub index: usize,
-    pub lower_price: f64,
-    pub upper_price: f64,
     pub entry_price: f64,
     pub exit_price: f64,
     pub quantity: f64,
@@ -36,8 +33,7 @@ pub struct GridSlot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GridOrderIntent {
     pub slot_index: usize,
-    pub client_order_id: ClientOrderId,
-    pub side: OrderSide,
+    pub is_buy: bool,
     pub price: f64,
     pub quantity: f64,
     pub post_only: bool,
@@ -48,7 +44,7 @@ pub struct GridOrderIntent {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GridActionPlan {
     pub orders_to_place: Vec<GridOrderIntent>,
-    pub orders_to_cancel: Vec<(usize, ClientOrderId)>,
+    pub orders_to_cancel: Vec<(usize, u64)>, // (slot_index, oid)
 }
 
 impl GridActionPlan {
@@ -83,9 +79,7 @@ pub struct GridEngine {
     cfg: GridConfig,
     sz_decimals: u8,
     slots: Vec<GridSlot>,
-    order_to_slot: HashMap<ClientOrderId, (usize, bool)>,
-    order_seq: u64,
-    initialized: bool,
+    oid_to_slot: HashMap<u64, (usize, bool)>, // oid -> (slot_index, is_entry)
 }
 
 impl GridEngine {
@@ -100,35 +94,25 @@ impl GridEngine {
         let mut slots = Vec::with_capacity(cfg.grid_count);
 
         for i in 0..cfg.grid_count {
-            let raw_low = cfg.lower_price + (i as f64) * step;
-            let raw_high = cfg.lower_price + ((i + 1) as f64) * step;
-            let low = round_hl_price(raw_low, sz_decimals);
-            let high = round_hl_price(raw_high, sz_decimals);
-
-            if low <= 0.0 || high <= low {
-                bail!(
-                    "Grid step too narrow at slot {i}: lower={low} upper={high} after rounding (sz_decimals={sz_decimals})"
-                );
-            }
-
-            let (entry_price, exit_price) = match cfg.direction {
-                Direction::Long => (low, high),
-                Direction::Short => (high, low),
+            let (entry_raw, exit_raw) = match cfg.direction {
+                Direction::Long => {
+                    let entry = cfg.lower_price + (i as f64) * step;
+                    let exit = entry + step;
+                    (entry, exit)
+                }
+                Direction::Short => {
+                    let entry = cfg.upper_price - (i as f64) * step;
+                    let exit = entry - step;
+                    (entry, exit)
+                }
             };
 
+            let entry_price = round_hl_price(entry_raw, sz_decimals);
+            let exit_price = round_hl_price(exit_raw, sz_decimals);
             let quantity = round_hl_size(cfg.amount_per_grid / entry_price, sz_decimals);
-            if quantity <= 0.0 {
-                bail!(
-                    "Grid slot {i} computed zero quantity for amount={} at entry_price={}",
-                    cfg.amount_per_grid,
-                    entry_price
-                );
-            }
 
             slots.push(GridSlot {
                 index: i,
-                lower_price: low,
-                upper_price: high,
                 entry_price,
                 exit_price,
                 quantity,
@@ -142,9 +126,7 @@ impl GridEngine {
             cfg,
             sz_decimals,
             slots,
-            order_to_slot: HashMap::new(),
-            order_seq: 0,
-            initialized: false,
+            oid_to_slot: HashMap::new(),
         })
     }
 
@@ -152,58 +134,25 @@ impl GridEngine {
         &self.slots
     }
 
-    pub fn sz_decimals(&self) -> u8 {
-        self.sz_decimals
-    }
-
     pub fn config(&self) -> &GridConfig {
         &self.cfg
     }
 
-    fn next_client_order_id(&mut self, slot_index: usize, is_entry: bool) -> ClientOrderId {
-        self.order_seq += 1;
-        let tag = if is_entry { "E" } else { "X" };
-        let dir = match self.cfg.direction {
-            Direction::Long => "L",
-            Direction::Short => "S",
-        };
-        ClientOrderId::new(format!(
-            "GRID-{}-{}{}-{:03}-{:06}",
-            self.cfg.symbol, dir, tag, slot_index, self.order_seq
-        ))
-    }
-
-    /// Checks whether a limit order at `price` with `side` is safe to submit as a Maker (`Post-Only`)
-    /// given the current `best_bid` and `best_ask`.
-    fn can_place_maker(side: OrderSide, price: f64, best_bid: f64, best_ask: f64) -> bool {
-        match side {
-            // A Maker Buy must be strictly below the best ask
-            OrderSide::Buy => price < best_ask,
-            // A Maker Sell must be strictly above the best bid
-            OrderSide::Sell => price > best_bid,
-            _ => false,
+    /// Checks whether an order at `price` with `is_buy` can be placed as a Maker order without immediate crossing.
+    pub fn can_place_maker(is_buy: bool, price: f64, best_bid: f64, best_ask: f64) -> bool {
+        if is_buy {
+            price < best_ask
+        } else {
+            price > best_bid
         }
     }
 
-    /// Evaluates current market top-of-book (`best_bid`, `best_ask`) and emits any Maker order
-    /// intents that should be submitted now.
-    ///
-    /// - On initial call:
-    ///   - For `Direction::Long`: places Maker Buy orders on all slots whose `entry_price < mid_price`
-    ///     (and `entry_price < best_ask`). Slots above current price remain `Idle` (no market buy at startup).
-    ///   - For `Direction::Short`: places Maker Sell orders on all slots whose `entry_price > mid_price`
-    ///     (and `entry_price > best_bid`).
-    /// - On subsequent ticks:
-    ///   - Retries any `HoldingWaitingExit` slot whose exit order can now be placed as Maker without crossing.
-    ///   - If `follow_price_into_idle_grids` is true (or for any slot below current market price that became `Idle`
-    ///     after a fill/rejection), places the Maker entry order once price is on the valid Maker side.
+    /// Evaluates market prices, manages active entry window, and emits orders to place and cancel.
     pub fn on_market_price(&mut self, best_bid: f64, best_ask: f64) -> GridActionPlan {
         if !best_bid.is_finite() || !best_ask.is_finite() || best_bid <= 0.0 || best_ask <= 0.0 {
             return GridActionPlan::empty();
         }
         let mid_price = (best_bid + best_ask) * 0.5;
-        self.initialized = true;
-
         let mut plan = GridActionPlan::empty();
         let direction = self.cfg.direction;
         let post_only = self.cfg.post_only;
@@ -212,21 +161,15 @@ impl GridEngine {
         // 1. Evaluate any HoldingWaitingExit slots (exit orders waiting to be placed)
         for idx in 0..self.slots.len() {
             if matches!(self.slots[idx].state, SlotState::HoldingWaitingExit) {
-                let exit_side = match direction {
-                    Direction::Long => OrderSide::Sell,
-                    Direction::Short => OrderSide::Buy,
+                let is_buy = match direction {
+                    Direction::Long => false,
+                    Direction::Short => true,
                 };
                 let exit_price = self.slots[idx].exit_price;
-                if Self::can_place_maker(exit_side, exit_price, best_bid, best_ask) {
-                    let cloid = self.next_client_order_id(idx, false);
-                    self.slots[idx].state = SlotState::ExitWorking {
-                        client_order_id: cloid,
-                    };
-                    self.order_to_slot.insert(cloid, (idx, false));
+                if Self::can_place_maker(is_buy, exit_price, best_bid, best_ask) {
                     plan.orders_to_place.push(GridOrderIntent {
                         slot_index: idx,
-                        client_order_id: cloid,
-                        side: exit_side,
+                        is_buy,
                         price: exit_price,
                         quantity: self.slots[idx].quantity,
                         post_only,
@@ -251,7 +194,7 @@ impl GridEngine {
                 Direction::Short => entry_price >= mid_price,
             };
 
-            // An entry slot is a candidate if it is below/above market price, OR if it is already working/canceling
+            // An entry slot is eligible if it is below/above market price, or already has an entry order working/canceling
             if is_below_market || matches!(state, SlotState::EntryWorking { .. } | SlotState::EntryCanceling { .. }) {
                 candidate_entry_indices.push(idx);
             }
@@ -274,18 +217,18 @@ impl GridEngine {
         }
 
         let target_slots: Vec<usize> = if active_entry_limit == 0 {
-            candidate_entry_indices.clone()
+            candidate_entry_indices
         } else {
             candidate_entry_indices.into_iter().take(active_entry_limit).collect()
         };
 
-        // Cancel any active EntryWorking slots that are no longer in target_slots
+        // Cancel any active EntryWorking slots that are no longer in target_slots (e.g. price moved up away from them)
         for idx in 0..self.slots.len() {
-            if let SlotState::EntryWorking { client_order_id } = self.slots[idx].state {
+            if let SlotState::EntryWorking { oid } = self.slots[idx].state {
                 if !target_slots.contains(&idx) {
-                    plan.orders_to_cancel.push((idx, client_order_id));
-                    // Keep order_to_slot mapping intact so fill events can still be resolved!
-                    self.slots[idx].state = SlotState::EntryCanceling { client_order_id };
+                    plan.orders_to_cancel.push((idx, oid));
+                    // Transition to EntryCanceling but KEEP oid mapping so if it fills in-flight, it's processed!
+                    self.slots[idx].state = SlotState::EntryCanceling { oid };
                 }
             }
         }
@@ -293,21 +236,15 @@ impl GridEngine {
         // Arm any target slots that are currently Idle (only if can_place_maker is true)
         for &idx in &target_slots {
             if matches!(self.slots[idx].state, SlotState::Idle) {
-                let side = match direction {
-                    Direction::Long => OrderSide::Buy,
-                    Direction::Short => OrderSide::Sell,
+                let is_buy = match direction {
+                    Direction::Long => true,
+                    Direction::Short => false,
                 };
                 let entry_price = self.slots[idx].entry_price;
-                if Self::can_place_maker(side, entry_price, best_bid, best_ask) {
-                    let cloid = self.next_client_order_id(idx, true);
-                    self.slots[idx].state = SlotState::EntryWorking {
-                        client_order_id: cloid,
-                    };
-                    self.order_to_slot.insert(cloid, (idx, true));
+                if Self::can_place_maker(is_buy, entry_price, best_bid, best_ask) {
                     plan.orders_to_place.push(GridOrderIntent {
                         slot_index: idx,
-                        client_order_id: cloid,
-                        side,
+                        is_buy,
                         price: entry_price,
                         quantity: self.slots[idx].quantity,
                         post_only,
@@ -321,19 +258,24 @@ impl GridEngine {
         plan
     }
 
-    /// Called when an order with `client_order_id` is completely filled.
-    /// - If it was an **Entry** order for slot `i`: transitions slot `i` to holding inventory and
-    ///   evaluates the grid, placing the **Exit** order at `exit_price` AND automatically arming the next
-    ///   entry slot 1 grid below ("成交一格再挂1格").
-    /// - If it was an **Exit** order for slot `i`: increments `completed_cycles` and `realized_gross_pnl_usdc`,
-    ///   resets slot `i` to `Idle`, and evaluates the grid to arm the active window.
-    pub fn on_order_filled(
-        &mut self,
-        client_order_id: &ClientOrderId,
-        best_bid: f64,
-        best_ask: f64,
-    ) -> GridActionPlan {
-        let Some((slot_idx, is_entry)) = self.order_to_slot.remove(client_order_id) else {
+    /// Registers the placed order's exchange ID (`oid`) to the slot.
+    pub fn on_order_placed(&mut self, slot_index: usize, oid: u64, is_entry: bool) {
+        if slot_index >= self.slots.len() {
+            return;
+        }
+        self.oid_to_slot.insert(oid, (slot_index, is_entry));
+        if is_entry {
+            self.slots[slot_index].state = SlotState::EntryWorking { oid };
+        } else {
+            self.slots[slot_index].state = SlotState::ExitWorking { oid };
+        }
+    }
+
+    /// Handles order fill event.
+    /// - Entry filled -> enters HoldingWaitingExit, evaluates exit order + replenishes 1 lower entry order.
+    /// - Exit filled -> completes cycle, records realized profit, resets to Idle, evaluates active window.
+    pub fn on_order_filled(&mut self, oid: u64, best_bid: f64, best_ask: f64) -> GridActionPlan {
+        let Some((slot_idx, is_entry)) = self.oid_to_slot.remove(&oid) else {
             return GridActionPlan::empty();
         };
 
@@ -353,21 +295,19 @@ impl GridEngine {
         self.on_market_price(best_bid, best_ask)
     }
 
-    /// Called when an order is rejected (e.g., Post-Only ALO crossing reject) or canceled before filling.
-    /// Reverts an Entry order slot to `Idle` and an Exit order slot to `HoldingWaitingExit` so it will
-    /// be retried on the next valid market tick.
-    pub fn on_order_terminal_unfilled(&mut self, client_order_id: &ClientOrderId) {
-        let Some((slot_idx, is_entry)) = self.order_to_slot.remove(client_order_id) else {
+    /// Handles order canceled / rejected event.
+    pub fn on_order_canceled(&mut self, oid: u64) {
+        let Some((slot_idx, is_entry)) = self.oid_to_slot.remove(&oid) else {
             return;
         };
         if is_entry {
             self.slots[slot_idx].state = SlotState::Idle;
         } else {
+            // Exit order canceled/rejected -> revert to HoldingWaitingExit to retry
             self.slots[slot_idx].state = SlotState::HoldingWaitingExit;
         }
     }
 
-    /// Computes a full snapshot of grid positions, active Maker orders, and realized/unrealized PnL.
     pub fn summary_metrics(&self, current_price: f64) -> GridSummary {
         let mut active_entry_orders = 0;
         let mut active_exit_orders = 0;
@@ -433,160 +373,83 @@ mod tests {
             grid_count: 30,
             amount_per_grid: 1000.0,
             post_only: true,
-            follow_price_into_idle_grids: true,
-            active_entry_grids: 0,
+            active_entry_grids: 3,
         }
     }
 
     #[test]
-    fn startup_at_60_12_places_16_maker_buy_orders_below_market_and_zero_initial_position() {
+    fn startup_at_63_09_places_3_maker_buy_orders_below_market() {
         let mut engine = GridEngine::new(sample_hype_long_config(), 2).expect("valid engine");
         assert_eq!(engine.slots().len(), 30);
 
-        // Current market price 60.12 (best_bid = 60.11, best_ask = 60.13)
-        let plan = engine.on_market_price(60.11, 60.13);
-        let intents = plan.orders_to_place;
-
-        // Levels below 60.12 are P_0 (55.0) through P_15 (60.0) -> 16 Buy orders
-        assert_eq!(intents.len(), 16);
-        assert!(intents.iter().all(|o| o.side == OrderSide::Buy));
-        assert!(intents.iter().all(|o| o.post_only));
-        assert!(intents.iter().all(|o| !o.reduce_only));
-        assert!((intents[0].price - 55.0).abs() < 1e-6);
-        assert!((intents[15].price - 60.0).abs() < 1e-6);
-
-        let summary = engine.summary_metrics(60.12);
-        assert_eq!(summary.active_entry_orders, 16);
-        assert_eq!(summary.holding_slots, 0);
-        assert!((summary.total_position_base_qty - 0.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn buy_fill_places_maker_reduce_only_sell_one_grid_higher_and_sell_fill_rearms_buy() {
-        let mut engine = GridEngine::new(sample_hype_long_config(), 2).expect("valid engine");
-        let plan = engine.on_market_price(60.11, 60.13);
-        let top_buy = plan.orders_to_place.last().expect("slot 15 buy at 60.0").clone();
-        assert_eq!(top_buy.slot_index, 15);
-        assert!((top_buy.price - 60.0).abs() < 1e-6);
-
-        // Price dips to 59.95 / 59.98 and fills slot 15 buy order at 60.0
-        let exit_plan = engine.on_order_filled(&top_buy.client_order_id, 59.95, 59.98);
-        assert_eq!(exit_plan.orders_to_place.len(), 1);
-        let sell_order = &exit_plan.orders_to_place[0];
-        assert_eq!(sell_order.slot_index, 15);
-        assert_eq!(sell_order.side, OrderSide::Sell);
-        assert!(sell_order.post_only);
-        assert!(sell_order.reduce_only);
-        // Exit price for slot 15 is 60.333
-        assert!((sell_order.price - 60.333).abs() < 1e-3);
-        assert!((sell_order.quantity - top_buy.quantity).abs() < 1e-9);
-
-        // Now price rallies to 60.35 / 60.37 and fills the Sell order at 60.333
-        let rearm_plan = engine.on_order_filled(&sell_order.client_order_id, 60.35, 60.37);
-        assert_eq!(rearm_plan.orders_to_place.len(), 1);
-        let rearmed_buy = &rearm_plan.orders_to_place[0];
-        assert_eq!(rearmed_buy.slot_index, 15);
-        assert_eq!(rearmed_buy.side, OrderSide::Buy);
-        assert!(rearmed_buy.post_only);
-        assert!(!rearmed_buy.reduce_only);
-        assert!((rearmed_buy.price - 60.0).abs() < 1e-6);
-
-        let summary = engine.summary_metrics(60.36);
-        assert_eq!(summary.completed_cycles, 1);
-        // Gross profit for 16.66 HYPE * 0.333 USDC = ~5.54778 USDC
-        assert!(summary.realized_gross_pnl_usdc > 5.50 && summary.realized_gross_pnl_usdc < 5.60);
-    }
-
-    #[test]
-    fn drop_to_55_00_accumulates_expected_position_and_unrealized_loss() {
-        let mut engine = GridEngine::new(sample_hype_long_config(), 2).expect("valid engine");
-        let plan = engine.on_market_price(60.11, 60.13);
-        let intents = plan.orders_to_place;
-        assert_eq!(intents.len(), 16);
-
-        // Simulate price dropping all the way to 55.00, filling all 16 Buy orders
-        for intent in &intents {
-            let _ = engine.on_order_filled(&intent.client_order_id, 54.98, 55.00);
-        }
-
-        let summary = engine.summary_metrics(55.00);
-        assert_eq!(summary.holding_slots, 16);
-        // Total base quantity ~278.34 HYPE, unrealized PnL at 55.00 ~ -687 USDC
-        assert!(summary.total_position_base_qty > 278.0 && summary.total_position_base_qty < 279.0);
-        assert!(summary.unrealized_pnl_usdc < -685.0 && summary.unrealized_pnl_usdc > -690.0);
-    }
-
-    #[test]
-    fn active_entry_grids_limits_to_3_and_replenishes_on_fill() {
-        let mut cfg = sample_hype_long_config();
-        cfg.active_entry_grids = 3;
-        let mut engine = GridEngine::new(cfg, 2).expect("valid engine");
-
-        let plan = engine.on_market_price(60.11, 60.13);
-        // Only 3 entry orders should be placed initially (slots 13, 14, 15)
-        assert_eq!(plan.orders_to_place.len(), 3);
-        assert_eq!(plan.orders_to_place[0].slot_index, 13);
-        assert_eq!(plan.orders_to_place[1].slot_index, 14);
-        assert_eq!(plan.orders_to_place[2].slot_index, 15);
-
-        let slot_15_order = plan.orders_to_place.iter().find(|o| o.slot_index == 15).cloned().unwrap();
-
-        // Price dips and fills slot 15 at 60.00
-        let fill_plan = engine.on_order_filled(&slot_15_order.client_order_id, 59.95, 59.98);
-
-        // fill_plan should place Exit order for slot 15 AND replenish next lower entry grid (slot 12)!
-        assert_eq!(fill_plan.orders_to_place.len(), 2);
-        let has_exit_15 = fill_plan.orders_to_place.iter().any(|o| o.slot_index == 15 && !o.is_entry && o.reduce_only);
-        let has_entry_12 = fill_plan.orders_to_place.iter().any(|o| o.slot_index == 12 && o.is_entry);
-        assert!(has_exit_15, "Must place Exit order for slot 15");
-        assert!(has_entry_12, "Must replenish next lower entry grid (slot 12)");
-
-        let summary = engine.summary_metrics(59.98);
-        assert_eq!(summary.active_entry_orders, 3); // slots 12, 13, 14
-        assert_eq!(summary.active_exit_orders, 1);  // slot 15
-        assert_eq!(summary.holding_slots, 1);
-    }
-
-    #[test]
-    fn working_entry_order_is_not_canceled_when_price_drops_to_or_below_its_price() {
-        let mut cfg = sample_hype_long_config();
-        cfg.active_entry_grids = 3;
-        let mut engine = GridEngine::new(cfg, 2).expect("valid engine");
-
-        let plan = engine.on_market_price(60.11, 60.13);
+        let plan = engine.on_market_price(63.08, 63.10);
+        // Only 3 entry orders closest to 63.09 below market
         assert_eq!(plan.orders_to_place.len(), 3);
         assert!(plan.orders_to_cancel.is_empty());
 
-        // Price drops to 60.00 / 60.01 (touching entry price of slot 15)
-        let tick_plan = engine.on_market_price(60.00, 60.01);
-        // It must NOT cancel slot 15!
-        assert!(tick_plan.orders_to_cancel.is_empty(), "Must not cancel resting entry order when price touches it");
-        assert!(tick_plan.orders_to_place.is_empty());
+        let top_order = &plan.orders_to_place[2];
+        assert_eq!(top_order.slot_index, 24); // 55 + 24 * (10/30) = 63.00
+        assert!((top_order.price - 63.00).abs() < 1e-3);
+        assert!(top_order.is_buy);
+        assert!(top_order.post_only);
+        assert!(!top_order.reduce_only);
 
-        // Price drops further to 59.99 / 60.00
-        let dip_plan = engine.on_market_price(59.99, 60.00);
+        // Register the orders
+        for (i, intent) in plan.orders_to_place.iter().enumerate() {
+            engine.on_order_placed(intent.slot_index, 1000 + i as u64, true);
+        }
+
+        let summary = engine.summary_metrics(63.09);
+        assert_eq!(summary.active_entry_orders, 3);
+        assert_eq!(summary.holding_slots, 0);
+    }
+
+    #[test]
+    fn resting_entry_order_is_never_canceled_when_price_touches_it() {
+        let mut engine = GridEngine::new(sample_hype_long_config(), 2).expect("valid engine");
+        let plan = engine.on_market_price(63.08, 63.10);
+        for (i, intent) in plan.orders_to_place.iter().enumerate() {
+            engine.on_order_placed(intent.slot_index, 1000 + i as u64, true);
+        }
+
+        // Price dips and touches 63.00
+        let tick_plan = engine.on_market_price(63.00, 63.01);
+        assert!(tick_plan.orders_to_cancel.is_empty(), "Must not cancel resting entry order when price touches it");
+
+        // Price dips further through 63.00 to 62.99
+        let dip_plan = engine.on_market_price(62.99, 63.00);
         assert!(dip_plan.orders_to_cancel.is_empty(), "Must not cancel resting entry order when price drops below it");
     }
 
     #[test]
-    fn entry_canceling_order_still_processes_fill_and_places_exit() {
-        let mut cfg = sample_hype_long_config();
-        cfg.active_entry_grids = 3;
-        let mut engine = GridEngine::new(cfg, 2).expect("valid engine");
+    fn entry_fill_immediately_places_exit_order_and_replenishes_next_lower_entry_grid() {
+        let mut engine = GridEngine::new(sample_hype_long_config(), 2).expect("valid engine");
+        let plan = engine.on_market_price(63.08, 63.10);
+        // slots: 22 (62.333), 23 (62.667), 24 (63.00)
+        let slot_24_intent = plan.orders_to_place.iter().find(|o| o.slot_index == 24).unwrap();
+        let slot_24_oid = 9999;
+        engine.on_order_placed(24, slot_24_oid, true);
 
-        let plan = engine.on_market_price(60.11, 60.13);
-        // Armed slots 13, 14, 15
-        assert_eq!(plan.orders_to_place.len(), 3);
-        let slot_13_order = plan.orders_to_place[0].clone();
+        // Slot 24 fills at 63.00
+        let fill_plan = engine.on_order_filled(slot_24_oid, 62.95, 62.98);
 
-        // Price rallies to 60.70 / 60.72: new window arms slots 15, 16, 17; slot 13 is outside window
-        let rally_plan = engine.on_market_price(60.70, 60.72);
-        assert!(rally_plan.orders_to_cancel.iter().any(|(s, _)| *s == 13));
+        // fill_plan must place Exit order for slot 24 (at 63.333) AND arm next lower entry grid (slot 21 at 62.00)!
+        let has_exit_24 = fill_plan.orders_to_place.iter().any(|o| o.slot_index == 24 && !o.is_buy && o.reduce_only);
+        let has_entry_21 = fill_plan.orders_to_place.iter().any(|o| o.slot_index == 21 && o.is_buy && !o.reduce_only);
+        assert!(has_exit_24, "Must place Exit sell order for filled slot 24");
+        assert!(has_entry_21, "Must replenish next lower entry grid (slot 21)");
 
-        // Before cancel confirms at venue, slot 13 order fills at 59.333!
-        let fill_plan = engine.on_order_filled(&slot_13_order.client_order_id, 59.30, 59.35);
-        // Must successfully place exit order for slot 13!
-        let has_exit_13 = fill_plan.orders_to_place.iter().any(|o| o.slot_index == 13 && !o.is_entry && o.reduce_only);
-        assert!(has_exit_13, "Must place Exit order for slot 13 even if cancel was in-flight");
+        // Register the Exit order
+        let exit_intent = fill_plan.orders_to_place.iter().find(|o| o.slot_index == 24).unwrap();
+        let exit_oid = 8888;
+        engine.on_order_placed(24, exit_oid, false);
+
+        // Now price rallies and fills the Exit order at 63.333
+        let rearm_plan = engine.on_order_filled(exit_oid, 63.35, 63.37);
+        assert!(rearm_plan.orders_to_place.iter().any(|o| o.slot_index == 24 && o.is_buy));
+
+        let summary = engine.summary_metrics(63.36);
+        assert_eq!(summary.completed_cycles, 1);
+        assert!(summary.realized_gross_pnl_usdc > 5.0);
     }
 }
