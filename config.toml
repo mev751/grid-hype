@@ -16,8 +16,8 @@ upper_price = 65.0
 # 网格数量: 划分 30 格 (每格间距 = (65 - 55) / 30 = 0.333333 USDC)
 grid_count = 30
 
-# 每格下单金额: 1000 USDC
-amount_per_grid = 1000.0
+# 每格下单金额: 1300 USDC
+amount_per_grid = 1300.0
 
 # 开仓与平仓均强制使用 Maker (Post-Only / ALO) 节省手续费
 post_only = true
