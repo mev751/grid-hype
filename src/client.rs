@@ -24,6 +24,16 @@ pub struct L2BookResponse {
     pub levels: Vec<Vec<L2Level>>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenOrderDetail {
+    pub coin: String,
+    pub side: String,
+    #[serde(rename = "limitPx")]
+    pub limit_px: String,
+    pub sz: String,
+    pub oid: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct HyperliquidClient {
     http_client: HttpClient,
@@ -159,6 +169,11 @@ impl HyperliquidClient {
     }
 
     pub async fn get_open_orders(&self, user_address: &str) -> Result<Vec<u64>> {
+        let orders = self.get_open_orders_detail(user_address).await?;
+        Ok(orders.into_iter().map(|o| o.oid).collect())
+    }
+
+    pub async fn get_open_orders_detail(&self, user_address: &str) -> Result<Vec<OpenOrderDetail>> {
         let payload = json!({
             "type": "openOrders",
             "user": user_address,
@@ -173,19 +188,10 @@ impl HyperliquidClient {
             .context("Failed to query openOrders")?;
 
         let text = res.text().await?;
-        let val: serde_json::Value = serde_json::from_str(&text)
-            .with_context(|| format!("Failed to parse openOrders JSON: {}", text))?;
+        let orders: Vec<OpenOrderDetail> = serde_json::from_str(&text)
+            .with_context(|| format!("Failed to parse openOrders detail JSON: {}", text))?;
 
-        let mut oids = Vec::new();
-        if let Some(orders) = val.as_array() {
-            for ord in orders {
-                if let Some(oid) = ord.get("oid").and_then(|o| o.as_u64()) {
-                    oids.push(oid);
-                }
-            }
-        }
-
-        Ok(oids)
+        Ok(orders)
     }
 
     pub async fn place_order(

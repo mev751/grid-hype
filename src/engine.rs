@@ -64,10 +64,9 @@ impl LiveGridRunner {
         let mid_price = (best_bid + best_ask) * 0.5;
         info!(best_bid, best_ask, mid_price, "Fetched live market BBO");
 
-        let initial_plan = grid.on_market_price(best_bid, best_ask);
-        let summary = grid.summary_metrics(mid_price);
-
         if self.dry_run {
+            let initial_plan = grid.on_market_price(best_bid, best_ask);
+            let _summary = grid.summary_metrics(mid_price);
             println!("==================== DRY-RUN GRID TABLE ====================");
             println!("Symbol: {} | Current BBO: bid={:.4}, ask={:.4}, mid={:.4}", symbol, best_bid, best_ask, mid_price);
             println!(
@@ -115,6 +114,30 @@ impl LiveGridRunner {
             .context("Could not determine user account address")?;
         info!(user_address = %user_address, "Resolved Hyperliquid trading user address");
 
+        // Startup Reconciliation Step 1: Adopt existing open orders on venue to prevent duplicate orders
+        if let Ok(existing_orders) = client.get_open_orders_detail(&user_address).await {
+            info!(count = existing_orders.len(), "Reconciling existing venue open orders on startup...");
+            for ord in existing_orders {
+                if ord.coin != *symbol { continue; }
+                let px = ord.limit_px.parse::<f64>().unwrap_or(0.0);
+                let is_buy = ord.side == "B";
+                for slot in grid.slots_mut() {
+                    let entry_match = (slot.entry_price - px).abs() < 1e-3;
+                    let exit_match = (slot.exit_price - px).abs() < 1e-3;
+                    if is_buy && entry_match && slot.state == SlotState::Idle {
+                        info!(slot = slot.index, oid = ord.oid, px, "Adopted existing venue entry order on startup");
+                        grid.adopt_order(slot.index, ord.oid, true);
+                        break;
+                    } else if !is_buy && exit_match && (slot.state == SlotState::Idle || slot.state == SlotState::HoldingWaitingExit) {
+                        info!(slot = slot.index, oid = ord.oid, px, "Adopted existing venue exit order on startup");
+                        grid.adopt_order(slot.index, ord.oid, false);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Startup Reconciliation Step 2: Adopt existing held position
         let (margin, positions) = client.get_account_state(&user_address).await?;
         info!(
             margin_usdc = margin,
@@ -122,9 +145,23 @@ impl LiveGridRunner {
             "Hyperliquid account balance & positions snapshot"
         );
 
+        let mut held_qty = 0.0;
+        for (coin, szi) in &positions {
+            if coin == symbol && *szi > 1e-4 {
+                held_qty = *szi;
+            }
+        }
+        if held_qty > 1e-4 {
+            info!(held_qty, "Account holds position on startup. Reconciling with grid slots to arm exits...");
+            grid.reconcile_existing_position(held_qty, mid_price);
+        }
+
+        // Startup Step 3: Now generate action plan aware of adopted orders and holdings
+        let initial_plan = grid.on_market_price(best_bid, best_ask);
+
         let mut slot_cooldowns: HashMap<usize, Instant> = HashMap::new();
 
-        // 2. Submit initial active Maker entry orders
+        // 4. Submit initial active Maker entry / exit orders
         info!("Submitting initial Maker grid orders...");
         self.dispatch_plan(&client, symbol, sz_decimals, &mut grid, &mut slot_cooldowns, initial_plan).await;
 

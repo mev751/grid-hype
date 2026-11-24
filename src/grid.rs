@@ -134,6 +134,37 @@ impl GridEngine {
         &self.slots
     }
 
+    pub fn slots_mut(&mut self) -> &mut [GridSlot] {
+        &mut self.slots
+    }
+
+    pub fn adopt_order(&mut self, slot_index: usize, oid: u64, is_entry: bool) {
+        if slot_index >= self.slots.len() {
+            return;
+        }
+        self.oid_to_slot.insert(oid, (slot_index, is_entry));
+        if is_entry {
+            self.slots[slot_index].state = SlotState::EntryWorking { oid };
+        } else {
+            self.slots[slot_index].state = SlotState::ExitWorking { oid };
+        }
+    }
+
+    /// Reconciles existing on-chain position on startup.
+    /// Marks the matching idle slots as HoldingWaitingExit so exit orders will be armed.
+    pub fn reconcile_existing_position(&mut self, total_qty: f64, mid_price: f64) {
+        let mut remaining_qty = total_qty;
+        for slot in self.slots.iter_mut().rev() {
+            if slot.entry_price <= mid_price && slot.state == SlotState::Idle && remaining_qty >= slot.quantity * 0.5 {
+                slot.state = SlotState::HoldingWaitingExit;
+                remaining_qty -= slot.quantity;
+                if remaining_qty <= 1e-4 {
+                    break;
+                }
+            }
+        }
+    }
+
     pub fn config(&self) -> &GridConfig {
         &self.cfg
     }
@@ -451,5 +482,39 @@ mod tests {
         let summary = engine.summary_metrics(63.36);
         assert_eq!(summary.completed_cycles, 1);
         assert!(summary.realized_gross_pnl_usdc > 5.0);
+    }
+
+    #[test]
+    fn startup_reconciliation_adopts_existing_orders_and_avoids_duplicate_placement() {
+        let mut engine = GridEngine::new(sample_hype_long_config(), 2).expect("valid engine");
+        
+        // Suppose slot 24 (63.00) already had an order 12345 on the exchange before restart
+        engine.adopt_order(24, 12345, true);
+
+        // Run market evaluation at 63.08
+        let plan = engine.on_market_price(63.08, 63.10);
+
+        // Slot 24 MUST NOT be in orders_to_place!
+        assert!(!plan.orders_to_place.iter().any(|o| o.slot_index == 24), "Adopted slot 24 must not place duplicate order");
+        
+        // Instead, only the remaining 2 candidate slots in the active window (23 and 22) should place orders
+        assert_eq!(plan.orders_to_place.len(), 2);
+    }
+
+    #[test]
+    fn startup_reconciliation_arms_exit_for_existing_unhedged_position() {
+        let mut engine = GridEngine::new(sample_hype_long_config(), 2).expect("valid engine");
+        
+        // Account holds ~15.8 HYPE on startup (approx 1 slot at 63.00)
+        engine.reconcile_existing_position(15.8, 63.05);
+
+        assert_eq!(engine.slots()[24].state, SlotState::HoldingWaitingExit);
+
+        // Run market evaluation at 63.08
+        let plan = engine.on_market_price(63.08, 63.10);
+
+        // Must place exit sell order for slot 24 at 63.333!
+        let has_exit = plan.orders_to_place.iter().any(|o| o.slot_index == 24 && !o.is_buy && o.reduce_only);
+        assert!(has_exit, "Must place exit order for reconciled holding position on startup");
     }
 }
