@@ -21,6 +21,10 @@ pub struct GridConfig {
     pub post_only: bool,
     #[serde(default = "default_active_entry_grids")]
     pub active_entry_grids: usize,
+    #[serde(default = "default_false")]
+    pub enable_base_position: bool,
+    #[serde(default = "default_base_position_grids")]
+    pub base_position_grids: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +48,14 @@ pub struct AppConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_base_position_grids() -> usize {
+    3
 }
 
 fn default_active_entry_grids() -> usize {
@@ -87,6 +99,9 @@ impl AppConfig {
         }
         if self.grid.amount_per_grid <= 0.0 {
             bail!("grid.amount_per_grid must be > 0.0");
+        }
+        if self.grid.enable_base_position && self.grid.base_position_grids == 0 {
+            bail!("grid.base_position_grids must be >= 1 when enable_base_position is true");
         }
         Ok(())
     }

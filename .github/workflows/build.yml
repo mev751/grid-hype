@@ -93,8 +93,8 @@ jobs:
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v0.2.2
-          name: "Grid Hype Release v0.2.2 (Native Rust)"
+          tag_name: v0.2.3
+          name: "Grid Hype Release v0.2.3 (Native Rust)"
           draft: false
           prerelease: false
           files: |

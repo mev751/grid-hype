@@ -9,7 +9,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[command(
     name = "grid-hype",
     author = "mev751",
-    version = "0.2.2",
+    version = "0.2.3",
     about = "High-performance Hyperliquid Maker Grid Arbitrage Engine in Native Rust"
 )]
 struct Args {

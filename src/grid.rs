@@ -151,15 +151,79 @@ impl GridEngine {
     }
 
     /// Reconciles existing on-chain position on startup.
-    /// Marks the matching idle slots as HoldingWaitingExit so exit orders will be armed.
+    /// Allocates held base position to exit slots above market price (for Long grid)
+    /// or below market price (for Short grid), arming them as HoldingWaitingExit so Maker exit orders will be placed.
     pub fn reconcile_existing_position(&mut self, total_qty: f64, mid_price: f64) {
         let mut remaining_qty = total_qty;
-        for slot in self.slots.iter_mut().rev() {
-            if slot.entry_price <= mid_price && slot.state == SlotState::Idle && remaining_qty >= slot.quantity * 0.5 {
-                slot.state = SlotState::HoldingWaitingExit;
-                remaining_qty -= slot.quantity;
-                if remaining_qty <= 1e-4 {
-                    break;
+        let direction = self.cfg.direction;
+
+        match direction {
+            Direction::Long => {
+                let mut candidate_indices: Vec<usize> = self
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.state == SlotState::Idle && s.exit_price > mid_price)
+                    .map(|(i, _)| i)
+                    .collect();
+
+                // Sort ascending by exit_price: nearest to current market price first
+                candidate_indices.sort_by(|&a, &b| {
+                    self.slots[a]
+                        .exit_price
+                        .partial_cmp(&self.slots[b].exit_price)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                for idx in candidate_indices {
+                    if remaining_qty <= 1e-4 {
+                        break;
+                    }
+                    let slot_qty = self.slots[idx].quantity;
+                    if remaining_qty >= slot_qty * 0.4 {
+                        let alloc_qty = if remaining_qty < slot_qty {
+                            round_hl_size(remaining_qty, self.sz_decimals)
+                        } else {
+                            slot_qty
+                        };
+                        self.slots[idx].quantity = alloc_qty;
+                        self.slots[idx].state = SlotState::HoldingWaitingExit;
+                        remaining_qty -= alloc_qty;
+                    }
+                }
+            }
+            Direction::Short => {
+                let mut candidate_indices: Vec<usize> = self
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.state == SlotState::Idle && s.exit_price < mid_price)
+                    .map(|(i, _)| i)
+                    .collect();
+
+                // Sort descending by exit_price: nearest to current market price first
+                candidate_indices.sort_by(|&a, &b| {
+                    self.slots[b]
+                        .exit_price
+                        .partial_cmp(&self.slots[a].exit_price)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                for idx in candidate_indices {
+                    if remaining_qty <= 1e-4 {
+                        break;
+                    }
+                    let slot_qty = self.slots[idx].quantity;
+                    if remaining_qty >= slot_qty * 0.4 {
+                        let alloc_qty = if remaining_qty < slot_qty {
+                            round_hl_size(remaining_qty, self.sz_decimals)
+                        } else {
+                            slot_qty
+                        };
+                        self.slots[idx].quantity = alloc_qty;
+                        self.slots[idx].state = SlotState::HoldingWaitingExit;
+                        remaining_qty -= alloc_qty;
+                    }
                 }
             }
         }
@@ -405,6 +469,8 @@ mod tests {
             amount_per_grid: 1000.0,
             post_only: true,
             active_entry_grids: 3,
+            enable_base_position: false,
+            base_position_grids: 3,
         }
     }
 
@@ -516,5 +582,32 @@ mod tests {
         // Must place exit sell order for slot 24 at 63.333!
         let has_exit = plan.orders_to_place.iter().any(|o| o.slot_index == 24 && !o.is_buy && o.reduce_only);
         assert!(has_exit, "Must place exit order for reconciled holding position on startup");
+    }
+
+    #[test]
+    fn startup_reconciliation_arms_multiple_exit_orders_for_base_position() {
+        let mut engine = GridEngine::new(sample_hype_long_config(), 2).expect("valid engine");
+        
+        // Mid price is 63.05. Suppose we have 31.6 HYPE (approx 2 slots of 15.8 HYPE each)
+        engine.reconcile_existing_position(31.6, 63.05);
+
+        // Slots with exit > 63.05:
+        // Slot 24: exit 63.333
+        // Slot 25: exit 63.667
+        assert_eq!(engine.slots()[24].state, SlotState::HoldingWaitingExit);
+        assert_eq!(engine.slots()[25].state, SlotState::HoldingWaitingExit);
+
+        // Market evaluation at 63.08
+        let plan = engine.on_market_price(63.08, 63.10);
+
+        // Must place exit sell orders for both slot 24 and slot 25
+        let exit_24 = plan.orders_to_place.iter().any(|o| o.slot_index == 24 && !o.is_buy && o.reduce_only);
+        let exit_25 = plan.orders_to_place.iter().any(|o| o.slot_index == 25 && !o.is_buy && o.reduce_only);
+        assert!(exit_24, "Must place exit for slot 24");
+        assert!(exit_25, "Must place exit for slot 25");
+
+        // And it must ALSO place 3 entry buy orders below 63.08 (slots 23, 22, 21)
+        let buy_count = plan.orders_to_place.iter().filter(|o| o.is_buy).count();
+        assert_eq!(buy_count, 3, "Must still place 3 active entry buy orders below market");
     }
 }

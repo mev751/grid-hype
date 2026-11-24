@@ -35,6 +35,8 @@ impl LiveGridRunner {
             amount_per_grid = self.cfg.grid.amount_per_grid,
             post_only = self.cfg.grid.post_only,
             active_entry_grids = self.cfg.grid.active_entry_grids,
+            enable_base_position = self.cfg.grid.enable_base_position,
+            base_position_grids = self.cfg.grid.base_position_grids,
             testnet = self.cfg.exchange.testnet,
             dry_run = self.dry_run,
             "Starting Hyperliquid Generic Maker Grid Bot"
@@ -65,18 +67,23 @@ impl LiveGridRunner {
         info!(best_bid, best_ask, mid_price, "Fetched live market BBO");
 
         if self.dry_run {
-            let initial_plan = grid.on_market_price(best_bid, best_ask);
+            if self.cfg.grid.enable_base_position {
+                let target_qty = (self.cfg.grid.base_position_grids as f64) * (self.cfg.grid.amount_per_grid / mid_price);
+                grid.reconcile_existing_position(target_qty, mid_price);
+            }
+            let _initial_plan = grid.on_market_price(best_bid, best_ask);
             let _summary = grid.summary_metrics(mid_price);
             println!("==================== DRY-RUN GRID TABLE ====================");
             println!("Symbol: {} | Current BBO: bid={:.4}, ask={:.4}, mid={:.4}", symbol, best_bid, best_ask, mid_price);
             println!(
-                "Direction: {:?} | Range: [{}, {}] | Grids: {} | Per Grid: {} USDC | Active Window: {} grids",
+                "Direction: {:?} | Range: [{}, {}] | Grids: {} | Per Grid: {} USDC | Active Window: {} grids | Base Position: {}",
                 self.cfg.grid.direction,
                 self.cfg.grid.lower_price,
                 self.cfg.grid.upper_price,
                 self.cfg.grid.grid_count,
                 self.cfg.grid.amount_per_grid,
-                if self.cfg.grid.active_entry_grids == 0 { "All (Unlimited)".to_string() } else { self.cfg.grid.active_entry_grids.to_string() }
+                if self.cfg.grid.active_entry_grids == 0 { "All (Unlimited)".to_string() } else { self.cfg.grid.active_entry_grids.to_string() },
+                if self.cfg.grid.enable_base_position { format!("Enabled ({} grids)", self.cfg.grid.base_position_grids) } else { "Disabled".to_string() }
             );
             println!("------------------------------------------------------------");
             for slot in grid.slots() {
@@ -156,8 +163,17 @@ impl LiveGridRunner {
             }
         }
         if held_qty > 1e-4 {
-            info!(held_qty, "Account holds position on startup. Reconciling with grid slots to arm exits...");
+            info!(
+                held_qty,
+                enable_base_position = self.cfg.grid.enable_base_position,
+                "Account holds on-chain position on startup. Reconciling with grid slots to arm exits..."
+            );
             grid.reconcile_existing_position(held_qty, mid_price);
+        } else if self.cfg.grid.enable_base_position {
+            warn!(
+                "Base position mode is enabled in config, but account currently holds 0 {}. Grid will enter via Maker buy orders on dips first.",
+                symbol
+            );
         }
 
         // Startup Step 3: Now generate action plan aware of adopted orders and holdings

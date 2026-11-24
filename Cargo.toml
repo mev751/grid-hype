@@ -1,6 +1,6 @@
 [package]
 name = "grid-hype"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Generic Hyperliquid Maker Grid Arbitrage Engine in Native Rust"
 license = "MIT"

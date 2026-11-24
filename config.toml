@@ -9,15 +9,15 @@ symbol = "HYPE"
 # 网格方向: "long" (做多网格) 或 "short" (做空网格)
 direction = "long"
 
-# 价格区间 (USDC): 55.0 到 65.0
-lower_price = 55.0
-upper_price = 65.0
+# 价格区间 (USDC): 60.0 到 70.0
+lower_price = 60.0
+upper_price = 70.0
 
-# 网格数量: 划分 30 格 (每格间距 = (65 - 55) / 30 = 0.333333 USDC)
+# 网格数量: 划分 30 格 (每格间距 = (70 - 60) / 30 = 0.333333 USDC)
 grid_count = 30
 
-# 每格下单金额: 1300 USDC
-amount_per_grid = 1300.0
+# 每格下单金额: 450 USDC
+amount_per_grid = 450.0
 
 # 开仓与平仓均强制使用 Maker (Post-Only / ALO) 节省手续费
 post_only = true
@@ -25,6 +25,13 @@ post_only = true
 # 现价下方最大同时激活的开仓挂单数 (默认 3，0 表示不限制/挂满全部下方网格)
 # 仅在现价下方维持最近的 3 格挂单，成交一格再挂一格，大幅节省保证金占用
 active_entry_grids = 3
+
+# 底仓模式配置
+# 是否启用底仓模式 (true 会在启动时自动对账接管现有持仓并作为底仓在现价上方挂出止盈卖单)
+enable_base_position = true
+
+# 目标底仓格数 (默认 3 格，对账时优先按现有持仓填充现价上方各档止盈卖单)
+base_position_grids = 3
 
 [exchange]
 # 是否使用测试网 (false = 主网 Mainnet, true = 测试网 Testnet)
