@@ -117,23 +117,27 @@ impl LiveGridRunner {
         // Startup Reconciliation Step 1: Adopt existing open orders on venue to prevent duplicate orders
         if let Ok(existing_orders) = client.get_open_orders_detail(&user_address).await {
             info!(count = existing_orders.len(), "Reconciling existing venue open orders on startup...");
+            let mut adoptions = Vec::new();
             for ord in existing_orders {
                 if ord.coin != *symbol { continue; }
                 let px = ord.limit_px.parse::<f64>().unwrap_or(0.0);
                 let is_buy = ord.side == "B";
-                for slot in grid.slots_mut() {
+                for slot in grid.slots() {
                     let entry_match = (slot.entry_price - px).abs() < 1e-3;
                     let exit_match = (slot.exit_price - px).abs() < 1e-3;
                     if is_buy && entry_match && slot.state == SlotState::Idle {
-                        info!(slot = slot.index, oid = ord.oid, px, "Adopted existing venue entry order on startup");
-                        grid.adopt_order(slot.index, ord.oid, true);
+                        adoptions.push((slot.index, ord.oid, px, true));
                         break;
                     } else if !is_buy && exit_match && (slot.state == SlotState::Idle || slot.state == SlotState::HoldingWaitingExit) {
-                        info!(slot = slot.index, oid = ord.oid, px, "Adopted existing venue exit order on startup");
-                        grid.adopt_order(slot.index, ord.oid, false);
+                        adoptions.push((slot.index, ord.oid, px, false));
                         break;
                     }
                 }
+            }
+
+            for (slot_idx, oid, px, is_entry) in adoptions {
+                info!(slot = slot_idx, oid, px, is_entry, "Adopted existing venue order on startup");
+                grid.adopt_order(slot_idx, oid, is_entry);
             }
         }
 
